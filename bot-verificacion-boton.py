@@ -63,6 +63,7 @@ GUIA-hosting-render.md para el paso a paso completo.
 import json
 import os
 
+import aiohttp
 import discord
 from aiohttp import web
 
@@ -116,6 +117,25 @@ async def setup_hook():
     await iniciar_servidor_web()
 
 
+async def _publicar_payload_crudo(channel_id: int, payload: dict):
+    """Publica un mensaje Components V2 llamando directamente a la API REST
+    de Discord (en vez de usar client.http.send_message, cuya firma interna
+    cambia entre versiones de discord.py sin previo aviso)."""
+    headers = {
+        "Authorization": f"Bot {BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers=headers,
+            json=payload,
+        ) as resp:
+            if resp.status >= 300:
+                detalle = await resp.text()
+                raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -129,9 +149,13 @@ async def on_message(message: discord.Message):
     with open(ARCHIVO_MENSAJE, encoding="utf-8") as f:
         payload = json.load(f)
 
-    # Enviamos el payload crudo (Components V2) porque discord.py aún
-    # no tiene una API de alto nivel para Container/Text Display/Separator.
-    await client.http.send_message(message.channel.id, payload)
+    try:
+        await _publicar_payload_crudo(message.channel.id, payload)
+    except Exception as err:
+        await message.reply(f"No pude publicar el mensaje: {err}", delete_after=15)
+        print(f"ERROR al publicar mensaje de verificación: {err}")
+        return
+
     await message.delete()
     print(f"Mensaje de verificación publicado en #{message.channel.name}")
 
