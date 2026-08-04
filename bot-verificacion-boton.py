@@ -499,24 +499,52 @@ async def on_member_join(member: discord.Member):
     else:
         print("ERROR: no se encontró el rol NV_ROLE_ID en este servidor.")
 
-    if LLEGADAS_CHANNEL_ID is None:
-        print("Aviso: LLEGADAS_CHANNEL_ID no está configurado — no se mandó bienvenida a", member)
-        return
-    canal = member.guild.get_channel(LLEGADAS_CHANNEL_ID)
-    if canal is None:
-        print(f"ERROR: no encontré el canal de llegadas {LLEGADAS_CHANNEL_ID}")
-        return
+    if LLEGADAS_CHANNEL_ID is not None:
+        canal = member.guild.get_channel(LLEGADAS_CHANNEL_ID)
+        if canal is None:
+            print(f"ERROR: no encontré el canal de llegadas {LLEGADAS_CHANNEL_ID}")
+        else:
+            embed = discord.Embed(
+                title="¡Bienvenido a ATC24 Español! 🛫",
+                description=(
+                    f"{member.mention}, gracias por unirte a la comunidad de ATC24 en español.\n\n"
+                    "**¿Qué es esto?** Somos una comunidad de simulación de control de tráfico aéreo y "
+                    "vuelo, en base al juego ATC24 de Roblox.\n\n"
+                    "**Para empezar:**\n"
+                    "1️⃣ Completá tu verificación aceptando las reglas de la comunidad.\n"
+                    "2️⃣ Dale un vistazo al reglamento y la guía de roles del servidor.\n"
+                    "3️⃣ Revisá tus mensajes directos — te mandamos un mensaje para elegir tu rama "
+                    "(Piloto o Controlador de Tráfico Aéreo) y empezar tu formación en Academia.\n\n"
+                    "¡Que tengas un buen vuelo! ✈️"
+                ),
+                color=discord.Color.blue(),
+            )
+            await canal.send(embed=embed)
 
-    embed = discord.Embed(
-        title="¡Bienvenido a ATC24 Español! 🛫",
+    # El DM para elegir rama se manda recién cuando se verifica de verdad
+    # (aprieta "Acepto y confirmo" en el mensaje de !publicar-verificacion),
+    # no acá — ver on_interaction más abajo.
+
+
+async def _mandar_eleccion_de_rama_por_dm(member: discord.Member):
+    embed_dm = discord.Embed(
+        title="Elegí tu rama en ATC24 Español",
         description=(
-            f"{member.mention}, gracias por unirte. Antes que nada, completá tu verificación aceptando "
-            "las reglas de la comunidad.\n\n"
-            "Cuando quieras, elegí tu rama para empezar tu camino en la red:"
+            "Cuando quieras, elegí por dónde arrancar tu camino en la red. "
+            "Esto te verifica en el servidor y te manda el link para inscribirte en Academia."
         ),
         color=discord.Color.blue(),
     )
-    await canal.send(embed=embed, view=BienvenidaView())
+    try:
+        await member.send(embed=embed_dm, view=BienvenidaView())
+    except discord.Forbidden:
+        if LLEGADAS_CHANNEL_ID is not None:
+            canal = member.guild.get_channel(LLEGADAS_CHANNEL_ID)
+            if canal is not None:
+                await canal.send(
+                    f"{member.mention} no pude mandarte un mensaje directo — abrí tus DMs a miembros del "
+                    "servidor y volvé a entrar, o pedile a un miembro de Staff que te ayude a elegir tu rama.",
+                )
 
 
 @client.event
@@ -865,6 +893,9 @@ async def on_interaction(interaction: discord.Interaction):
         ephemeral=True,
     )
     print(f"{member} confirmó verificación por botón.")
+
+    # Recién ahora, ya verificado, le mandamos el DM para elegir su rama.
+    await _mandar_eleccion_de_rama_por_dm(member)
 
 
 if __name__ == "__main__":
