@@ -82,6 +82,12 @@ PORT = int(os.environ.get("PORT", "10000"))  # Render inyecta PORT automáticame
 # en propagarse la primera vez.
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 
+# Para que /ascender pueda consultar Academia en la web (repo ATC24Espanol,
+# separado de este). BOT_SHARED_SECRET debe ser EXACTAMENTE igual al que
+# está en el .env de la web (variable del mismo nombre).
+WEB_API_BASE = os.environ.get("WEB_API_BASE", "https://atc24espanol.lat")
+BOT_SHARED_SECRET = os.environ.get("BOT_SHARED_SECRET")
+
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
 
@@ -213,6 +219,43 @@ def build_nickname(member: discord.Member):
     return f"{prefijo} | {base_name}"
 
 
+async def enforce_base_tags(member: discord.Member) -> bool:
+    """El rol base ATC (Controlador de Tráfico Aéreo) y FLT (Piloto) sigue
+    al rating real: si tiene cualquier rango de esa rama que NO sea el de
+    estudiante (ATO/APA), debe tener el rol base sí o sí; si no tiene
+    ningún rating de esa rama, no debe tenerlo. Devuelve True si cambió algo."""
+    role_ids = {r.id for r in member.roles}
+
+    tiene_rating_atc = any(rid in role_ids for rid in ATC_ORDER if rid != ATC_ORDER[-1])  # excluye ATO
+    tiene_rating_piloto = any(rid in role_ids for rid in PILOTO_ORDER if rid != PILOTO_ORDER[-1])  # excluye APA
+
+    a_agregar = []
+    a_quitar = []
+
+    if tiene_rating_atc and ATC_ROLE_ID not in role_ids:
+        a_agregar.append(ATC_ROLE_ID)
+    elif not tiene_rating_atc and ATC_ROLE_ID in role_ids:
+        a_quitar.append(ATC_ROLE_ID)
+
+    if tiene_rating_piloto and FLT_ROLE_ID not in role_ids:
+        a_agregar.append(FLT_ROLE_ID)
+    elif not tiene_rating_piloto and FLT_ROLE_ID in role_ids:
+        a_quitar.append(FLT_ROLE_ID)
+
+    if not a_agregar and not a_quitar:
+        return False
+
+    if a_agregar:
+        roles_obj = [r for r in (member.guild.get_role(rid) for rid in a_agregar) if r is not None]
+        if roles_obj:
+            await member.add_roles(*roles_obj, reason="Rol base sigue al rating (ATC/FLT)")
+    if a_quitar:
+        roles_obj = [r for r in (member.guild.get_role(rid) for rid in a_quitar) if r is not None]
+        if roles_obj:
+            await member.remove_roles(*roles_obj, reason="Sin rating en esa rama — se retira el rol base")
+    return True
+
+
 async def enforce_single_rank_per_category(member: discord.Member) -> bool:
     """Si el miembro tiene más de un rango dentro de la misma categoría
     (ej. S1 y S2 a la vez), retira todos menos el más alto. Devuelve True
@@ -237,6 +280,62 @@ async def enforce_single_rank_per_category(member: discord.Member) -> bool:
 def has_any_role(member: discord.Member, role_ids: list) -> bool:
     ids = {r.id for r in member.roles}
     return any(rid in ids for rid in role_ids)
+
+
+def _categoria_de_rol(role_id: int):
+    if role_id in LIDERAZGO_ORDER:
+        return "LIDERAZGO"
+    if role_id in INSTRUCTOR_ORDER:
+        return "INSTRUCTOR"
+    if role_id in ATC_ORDER:
+        return "ATC"
+    if role_id in PILOTO_ORDER:
+        return "PILOTO"
+    if role_id in GC_ORDER:
+        return "GC"
+    return None
+
+
+def _puede_ascender(invocador: discord.Member, categoria: str) -> bool:
+    """Liderazgo puede otorgar cualquier categoría. Cada instructor solo
+    puede otorgar rangos de SU rama (CTI→ATC, CFI→Piloto, GTI→Equipo de
+    Tierra). Instructor/Liderazgo como categoría de DESTINO solo lo puede
+    otorgar Liderazgo."""
+    if has_any_role(invocador, LIDERAZGO_ORDER):
+        return True
+    if categoria == "ATC":
+        return INSTRUCTOR_ORDER[0] in {r.id for r in invocador.roles}  # CTI
+    if categoria == "PILOTO":
+        return INSTRUCTOR_ORDER[1] in {r.id for r in invocador.roles}  # CFI
+    if categoria == "GC":
+        return INSTRUCTOR_ORDER[2] in {r.id for r in invocador.roles}  # GTI
+    return False
+
+
+async def _certificado_en_rama(discord_id: str, branch: str) -> bool:
+    """Consulta la web (repo ATC24Espanol) para saber si el usuario tiene
+    certificado (teoría + examen final) en esa rama de Academia. Falla
+    "cerrado" (devuelve False) si el secreto no está configurado, en vez de
+    dejar pasar el ascenso sin poder verificar nada."""
+    if not BOT_SHARED_SECRET:
+        raise RuntimeError("BOT_SHARED_SECRET no está configurado en el bot")
+    url = f"{WEB_API_BASE}/api/bot/academy-status/{discord_id}"
+    headers = {"x-bot-secret": BOT_SHARED_SECRET}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, params={"branch": branch}) as resp:
+            if resp.status != 200:
+                detalle = await resp.text()
+                raise RuntimeError(f"la web respondió {resp.status}: {detalle}")
+            data = await resp.json()
+            return bool(data.get("certified"))
+
+
+# Todas las categorías ascendibles por comando (Liderazgo/Instructor incluidos,
+# para que el staff tenga un solo comando en vez de asignar roles a mano).
+RANGO_CHOICES = [
+    app_commands.Choice(name=PREFIX_LABELS[rid], value=str(rid))
+    for rid in (LIDERAZGO_ORDER + INSTRUCTOR_ORDER + ATC_ORDER + PILOTO_ORDER + GC_ORDER)
+]
 
 
 def _target_nickname(member: discord.Member):
@@ -266,31 +365,40 @@ async def actualizar_apodo(member: discord.Member):
     return objetivo, True
 
 
-async def _asignar_rol_bienvenida(interaction: discord.Interaction, role_id: int, nombre_rol: str, ruta_academia: str):
+async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama: str, ruta_academia: str):
+    """Elegir rama en el mensaje de bienvenida verifica al usuario (V, se
+    saca NV) y lo manda a inscribirse en Academia — NO le da FLT ni ATC acá:
+    esos roles base solo se otorgan cuando tiene un rating real (ver
+    enforce_base_tags), y el rol de estudiante (ATO/APA) lo otorga la propia
+    web al completar la inscripción en Academia."""
     guild = interaction.guild
     member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
-    rol = guild.get_role(role_id)
-    if rol is None:
-        await interaction.response.send_message("No encontré ese rol — avisa al staff.", ephemeral=True)
-        print(f"ERROR: no se encontró el rol {role_id} para el botón de bienvenida.")
+
+    v_role = guild.get_role(V_ROLE_ID)
+    nv_role = guild.get_role(NV_ROLE_ID)
+    if v_role is None or nv_role is None:
+        await interaction.response.send_message("Hubo un problema encontrando los roles V/NV. Avisa al staff.", ephemeral=True)
+        print("ERROR: no se encontraron V_ROLE_ID/NV_ROLE_ID para el botón de bienvenida.")
         return
 
-    ya_tenia = rol in member.roles
-    if not ya_tenia:
-        try:
-            await member.add_roles(rol, reason="Eligió su rama en el mensaje de bienvenida")
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "No pude asignarte el rol — el bot no tiene permisos suficientes. Avisa al staff.",
-                ephemeral=True,
-            )
-            return
+    ya_verificado = v_role in member.roles
+    try:
+        if not ya_verificado:
+            await member.add_roles(v_role, reason="Eligió su rama en el mensaje de bienvenida")
+        if nv_role in member.roles:
+            await member.remove_roles(nv_role, reason="Eligió su rama en el mensaje de bienvenida")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "No pude verificarte — el bot no tiene permisos suficientes. Avisa al staff.",
+            ephemeral=True,
+        )
+        return
 
-    saludo = f"¡Bienvenido a bordo como **{nombre_rol}**! 🎉" if not ya_tenia else f"Ya tenías el rol de **{nombre_rol}**, todo en orden. ✈️"
+    saludo = "¡Verificación confirmada! 🎉" if not ya_verificado else "Ya estabas verificado, todo en orden. ✈️"
     mensaje = (
         f"{saludo}\n"
-        f"Ahora entra a https://atc24espanol.lat/{ruta_academia} para completar tu inscripción real "
-        "en Academia (examen de admisión y formación) y no olvides verificarte si todavía no lo hiciste."
+        f"Ahora entra a https://atc24espanol.lat/{ruta_academia} para inscribirte en Academia — {nombre_rama} — "
+        "y empezar tu formación real (examen de admisión, lecciones, evaluación final)."
     )
 
     try:
@@ -312,11 +420,11 @@ class BienvenidaView(discord.ui.View):
 
     @discord.ui.button(label="✈️ Quiero ser Piloto", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_PILOTO)
     async def piloto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _asignar_rol_bienvenida(interaction, FLT_ROLE_ID, "Piloto", "academia/pilotos")
+        await _asignar_rol_bienvenida(interaction, "Piloto", "academia/pilotos")
 
     @discord.ui.button(label="🎙️ Quiero ser ATC", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_ATC)
     async def atc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _asignar_rol_bienvenida(interaction, ATC_ROLE_ID, "Controlador de Tráfico Aéreo", "academia/atc")
+        await _asignar_rol_bienvenida(interaction, "Controlador de Tráfico Aéreo", "academia/atc")
 
 # ─────────────────────────────────────────────────────────────
 
@@ -373,6 +481,17 @@ async def setup_hook():
 
 @client.event
 async def on_member_join(member: discord.Member):
+    # Se une por primera vez o vuelve a unirse tras haberse ido — en ambos
+    # casos Discord lo deja sin roles, así que hay que darle NV explícito.
+    nv_role = member.guild.get_role(NV_ROLE_ID)
+    if nv_role is not None:
+        try:
+            await member.add_roles(nv_role, reason="Ingreso al servidor — pendiente de verificación")
+        except discord.Forbidden:
+            print(f"ERROR 403: no pude darle NV a {member} al unirse — revisa la jerarquía del bot.")
+    else:
+        print("ERROR: no se encontró el rol NV_ROLE_ID en este servidor.")
+
     if LLEGADAS_CHANNEL_ID is None:
         print("Aviso: LLEGADAS_CHANNEL_ID no está configurado — no se mandó bienvenida a", member)
         return
@@ -399,11 +518,68 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         return
     try:
         await enforce_single_rank_per_category(after)
+        await enforce_base_tags(after)
         await actualizar_apodo(after)  # sigue el flujo borrar->calcular->cambiar
     except discord.Forbidden:
         print(f"No pude actualizar roles/apodo de {after} — jerarquía del bot insuficiente o es el dueño del servidor.")
     except discord.HTTPException as err:
         print(f"Error de Discord actualizando a {after}: {err}")
+
+
+@tree.command(name="ascender", description="[Instructor/Liderazgo] Otorga un rango a un usuario")
+@app_commands.describe(miembro="Usuario a ascender", rango="Rango a otorgar")
+@app_commands.choices(rango=RANGO_CHOICES)
+async def ascender(interaction: discord.Interaction, miembro: discord.Member, rango: app_commands.Choice[str]):
+    role_id = int(rango.value)
+    categoria = _categoria_de_rol(role_id)
+    if categoria is None:
+        await interaction.response.send_message("Rango desconocido.", ephemeral=True)
+        return
+
+    if not _puede_ascender(interaction.user, categoria):
+        await interaction.response.send_message(
+            "No tienes permiso para otorgar ese rango (necesitás ser Instructor de esa rama o Liderazgo).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)  # la consulta a la web puede tardar más de 3s
+
+    if categoria in ("ATC", "PILOTO"):
+        branch = "atc" if categoria == "ATC" else "pilot"
+        try:
+            certificado = await _certificado_en_rama(str(miembro.id), branch)
+        except Exception as err:
+            await interaction.followup.send(f"No pude verificar Academia en la web: {err}", ephemeral=True)
+            print(f"ERROR /ascender consultando la web: {err}")
+            return
+        if not certificado:
+            await interaction.followup.send(
+                f"{miembro.mention} todavía no tiene el certificado de **{branch.upper()}** en Academia "
+                "(teoría + examen final) — no se puede ascender hasta que lo complete.",
+                ephemeral=True,
+            )
+            return
+
+    rol = interaction.guild.get_role(role_id)
+    if rol is None:
+        await interaction.followup.send("No encontré ese rol en el servidor — avisa al staff.", ephemeral=True)
+        return
+    try:
+        await miembro.add_roles(rol, reason=f"Ascenso otorgado por {interaction.user} (/ascender)")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "No pude asignar el rol — la jerarquía de roles del bot es insuficiente.",
+            ephemeral=True,
+        )
+        return
+
+    # No hace falta llamar enforce_single_rank_per_category/actualizar_apodo acá:
+    # el add_roles de arriba dispara on_member_update, que ya se encarga.
+    await interaction.followup.send(
+        f"Listo — {miembro.mention} ahora tiene **{PREFIX_LABELS.get(role_id, rol.name)}**.",
+        ephemeral=True,
+    )
 
 
 @apodo_group.command(name="yo", description="Actualiza tu propio apodo según tus roles actuales")
@@ -479,6 +655,34 @@ async def apodo_todos(interaction: discord.Interaction):
 
     await interaction.followup.send(
         f"Listo. Apodos actualizados: {actualizados}. No se pudieron cambiar: {fallidos} "
+        "(probablemente su rol más alto está por encima del bot, o son el dueño del servidor).",
+        ephemeral=True,
+    )
+
+
+@apodo_group.command(name="borrartodos", description="[Solo dueño del server] Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
+async def apodo_borrar_todos(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Borrando el apodo de todo el servidor, esto puede tardar…", ephemeral=True)
+
+    borrados = 0
+    fallidos = 0
+    async for member in interaction.guild.fetch_members(limit=None):
+        if member.nick is None:
+            continue  # ya no tiene apodo, nada que hacer
+        try:
+            await member.edit(nick=None, reason=f"Borrado masivo de apodos por {interaction.user}")
+            borrados += 1
+        except (discord.Forbidden, discord.HTTPException):
+            fallidos += 1
+            continue
+        await asyncio.sleep(0.5)  # evitar rate limit de Discord
+
+    await interaction.followup.send(
+        f"Listo. Apodos borrados: {borrados}. No se pudieron borrar: {fallidos} "
         "(probablemente su rol más alto está por encima del bot, o son el dueño del servidor).",
         ephemeral=True,
     )
