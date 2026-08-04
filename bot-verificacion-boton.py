@@ -312,22 +312,29 @@ def _puede_ascender(invocador: discord.Member, categoria: str) -> bool:
     return False
 
 
-async def _certificado_en_rama(discord_id: str, branch: str) -> bool:
-    """Consulta la web (repo ATC24Espanol) para saber si el usuario tiene
-    certificado (teoría + examen final) en esa rama de Academia. Falla
-    "cerrado" (devuelve False) si el secreto no está configurado, en vez de
-    dejar pasar el ascenso sin poder verificar nada."""
+async def _consulta_web(ruta: str, params: dict = None) -> dict:
+    """GET genérico contra la API de la web, autenticado con BOT_SHARED_SECRET.
+    Lanza RuntimeError con un mensaje legible si algo sale mal."""
     if not BOT_SHARED_SECRET:
         raise RuntimeError("BOT_SHARED_SECRET no está configurado en el bot")
-    url = f"{WEB_API_BASE}/api/bot/academy-status/{discord_id}"
+    url = f"{WEB_API_BASE}{ruta}"
     headers = {"x-bot-secret": BOT_SHARED_SECRET}
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params={"branch": branch}) as resp:
+        async with session.get(url, headers=headers, params=params or {}) as resp:
             if resp.status != 200:
                 detalle = await resp.text()
                 raise RuntimeError(f"la web respondió {resp.status}: {detalle}")
-            data = await resp.json()
-            return bool(data.get("certified"))
+            return await resp.json()
+
+
+BRANCH_LABEL = {"atc": "ATC", "pilot": "Piloto"}
+
+
+async def _certificado_en_rama(discord_id: str, branch: str) -> bool:
+    """Consulta la web (repo ATC24Espanol) para saber si el usuario tiene
+    certificado (teoría + examen final) en esa rama de Academia."""
+    data = await _consulta_web(f"/api/bot/academy-status/{discord_id}", {"branch": branch})
+    return bool(data.get("certified"))
 
 
 # Todas las categorías ascendibles por comando (Liderazgo/Instructor incluidos,
@@ -686,6 +693,92 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
         "(probablemente su rol más alto está por encima del bot, o son el dueño del servidor).",
         ephemeral=True,
     )
+
+
+@tree.command(name="progreso", description="Muestra tu progreso en Academia (cursos, evaluaciones, certificados)")
+async def progreso(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await _consulta_web(f"/api/bot/user-progress/{interaction.user.id}")
+    except Exception as err:
+        await interaction.followup.send(f"No pude consultar tu progreso: {err}", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="Tu progreso en Academia", color=discord.Color.blurple())
+
+    if not data.get("enrollments"):
+        embed.description = "Todavía no te inscribiste en ninguna rama de Academia."
+    for curso in data.get("courseProgress", []):
+        estado = f"{curso['state']}" + (f" · examen: {curso['evalState']}" if curso.get("evalState") else "")
+        embed.add_field(
+            name=f"{BRANCH_LABEL.get(curso['branch'], curso['branch'])} — {curso['courseTitle']}",
+            value=estado,
+            inline=False,
+        )
+    certs = data.get("certificates", [])
+    if certs:
+        texto = "\n".join(f"🏅 {c['courseTitle']} ({c['type']})" for c in certs)
+        embed.add_field(name="Certificados", value=texto, inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="certificado", description="Muestra los certificados de un usuario en Academia")
+@app_commands.describe(miembro="Usuario a consultar (si lo dejás vacío, se muestra el tuyo)")
+async def certificado(interaction: discord.Interaction, miembro: discord.Member = None):
+    objetivo = miembro or interaction.user
+    await interaction.response.defer()
+    try:
+        data = await _consulta_web(f"/api/bot/certificates/{objetivo.id}")
+    except Exception as err:
+        await interaction.followup.send(f"No pude consultar los certificados: {err}", ephemeral=True)
+        return
+
+    items = data.get("items", [])
+    if not items:
+        await interaction.followup.send(f"{objetivo.mention} todavía no tiene certificados en Academia.")
+        return
+
+    embed = discord.Embed(title=f"Certificados de {objetivo.display_name}", color=discord.Color.gold())
+    for c in items:
+        embed.add_field(
+            name=f"{BRANCH_LABEL.get(c['branch'], c['branch'])} — {c['courseTitle']}",
+            value=f"{c['type']} · {c['issuedAt']}",
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="cola", description="[Instructor/Liderazgo] Muestra las evaluaciones pendientes de revisar")
+@app_commands.describe(rama="Filtrar por rama (dejalo vacío para ver ambas)")
+@app_commands.choices(rama=[
+    app_commands.Choice(name="ATC", value="atc"),
+    app_commands.Choice(name="Piloto", value="pilot"),
+])
+async def cola(interaction: discord.Interaction, rama: app_commands.Choice[str] = None):
+    es_instructor = has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER)
+    if not es_instructor:
+        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await _consulta_web("/api/bot/pending-evaluations", {"branch": rama.value} if rama else None)
+    except Exception as err:
+        await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
+        return
+
+    items = data.get("items", [])
+    if not items:
+        await interaction.followup.send("No hay evaluaciones pendientes ahora mismo. 🎉", ephemeral=True)
+        return
+
+    texto = "\n".join(
+        f"• **{it['username']}** — {BRANCH_LABEL.get(it['branch'], it['branch'])} · {it['courseTitle']} ({it['evalState']})"
+        for it in items
+    )
+    embed = discord.Embed(title="Evaluaciones pendientes", description=texto, color=discord.Color.orange())
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def _publicar_payload_crudo(channel_id: int, payload: dict):
