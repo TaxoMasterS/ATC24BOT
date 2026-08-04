@@ -85,7 +85,14 @@ GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
 
+FLT_ROLE_ID = 1238796825381834760   # FLT | Piloto (rol base)
+ATC_ROLE_ID = 1532224008555204669   # ATC | Controlador de Tráfico Aéreo (rol base)
+
+LLEGADAS_CHANNEL_ID = 1238796825415389294
+
 CUSTOM_ID = "atc24_verificar_aceptacion"
+CUSTOM_ID_PILOTO = "atc24_bienvenida_piloto"
+CUSTOM_ID_ATC = "atc24_bienvenida_atc"
 ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "verificacion-boton-components-v2.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
@@ -232,14 +239,84 @@ def has_any_role(member: discord.Member, role_ids: list) -> bool:
     return any(rid in ids for rid in role_ids)
 
 
-async def actualizar_apodo(member: discord.Member) -> str | None:
-    """Recalcula y aplica el apodo de un miembro. Devuelve el nuevo apodo
-    aplicado, o None si no había nada que asignar."""
+def _target_nickname(member: discord.Member):
+    """Nombre final que debería tener el miembro: con prefijo si le
+    corresponde, o su nombre limpio (sin prefijo) si no tiene ningún rol
+    que lo amerite."""
     nuevo = build_nickname(member)
-    if not nuevo or nuevo == member.display_name:
-        return nuevo
-    await member.edit(nick=nuevo, reason="Actualización automática de apodo por jerarquía de roles")
-    return nuevo
+    return nuevo if nuevo is not None else _strip_prefix(member.display_name)
+
+
+async def actualizar_apodo(member: discord.Member):
+    """Sigue el flujo pedido: BORRAR apodo actual -> CALCULAR el nuevo ->
+    CAMBIAR. Si el miembro ya tiene exactamente el apodo que le corresponde,
+    no hace ninguna llamada a la API (evita rate-limit innecesario en
+    /apodo todos). Devuelve (nombre_final, hubo_cambio)."""
+    objetivo = _target_nickname(member)
+    if objetivo == member.display_name:
+        return objetivo, False
+
+    if member.nick is not None:
+        await member.edit(nick=None, reason="Actualización de apodo — paso 1/2: borrar")
+
+    nuevo = build_nickname(member)
+    if nuevo:
+        await member.edit(nick=nuevo, reason="Actualización de apodo — paso 2/2: cambiar")
+
+    return objetivo, True
+
+
+async def _asignar_rol_bienvenida(interaction: discord.Interaction, role_id: int, nombre_rol: str, ruta_academia: str):
+    guild = interaction.guild
+    member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
+    rol = guild.get_role(role_id)
+    if rol is None:
+        await interaction.response.send_message("No encontré ese rol — avisa al staff.", ephemeral=True)
+        print(f"ERROR: no se encontró el rol {role_id} para el botón de bienvenida.")
+        return
+
+    ya_tenia = rol in member.roles
+    if not ya_tenia:
+        try:
+            await member.add_roles(rol, reason="Eligió su rama en el mensaje de bienvenida")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "No pude asignarte el rol — el bot no tiene permisos suficientes. Avisa al staff.",
+                ephemeral=True,
+            )
+            return
+
+    saludo = f"¡Bienvenido a bordo como **{nombre_rol}**! 🎉" if not ya_tenia else f"Ya tenías el rol de **{nombre_rol}**, todo en orden. ✈️"
+    mensaje = (
+        f"{saludo}\n"
+        f"Ahora entra a https://atc24espanol.lat/{ruta_academia} para completar tu inscripción real "
+        "en Academia (examen de admisión y formación) y no olvides verificarte si todavía no lo hiciste."
+    )
+
+    try:
+        await member.send(mensaje)
+        await interaction.response.send_message("Te mandé los detalles por mensaje directo 📬", ephemeral=True)
+    except discord.Forbidden:
+        # Tiene los DMs cerrados — respondemos acá mismo como respaldo.
+        await interaction.response.send_message(mensaje, ephemeral=True)
+
+
+class BienvenidaView(discord.ui.View):
+    """Vista persistente (timeout=None) con los botones de elección de rama.
+    Se registra en setup_hook vía client.add_view() para seguir funcionando
+    después de reiniciar el bot, sin depender de que el mensaje original
+    siga "vivo" en memoria."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✈️ Quiero ser Piloto", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_PILOTO)
+    async def piloto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _asignar_rol_bienvenida(interaction, FLT_ROLE_ID, "Piloto", "academia/pilotos")
+
+    @discord.ui.button(label="🎙️ Quiero ser ATC", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_ATC)
+    async def atc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _asignar_rol_bienvenida(interaction, ATC_ROLE_ID, "Controlador de Tráfico Aéreo", "academia/atc")
 
 # ─────────────────────────────────────────────────────────────
 
@@ -281,6 +358,8 @@ async def setup_hook():
     # web aquí para que Render vea el puerto abierto cuanto antes.
     await iniciar_servidor_web()
 
+    client.add_view(BienvenidaView())  # persistente: sobrevive a reinicios del bot
+
     tree.add_command(apodo_group)
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
@@ -293,12 +372,34 @@ async def setup_hook():
 
 
 @client.event
+async def on_member_join(member: discord.Member):
+    if LLEGADAS_CHANNEL_ID is None:
+        print("Aviso: LLEGADAS_CHANNEL_ID no está configurado — no se mandó bienvenida a", member)
+        return
+    canal = member.guild.get_channel(LLEGADAS_CHANNEL_ID)
+    if canal is None:
+        print(f"ERROR: no encontré el canal de llegadas {LLEGADAS_CHANNEL_ID}")
+        return
+
+    embed = discord.Embed(
+        title="¡Bienvenido a ATC24 Español! 🛫",
+        description=(
+            f"{member.mention}, gracias por unirte. Antes que nada, completá tu verificación aceptando "
+            "las reglas de la comunidad.\n\n"
+            "Cuando quieras, elegí tu rama para empezar tu camino en la red:"
+        ),
+        color=discord.Color.blue(),
+    )
+    await canal.send(embed=embed, view=BienvenidaView())
+
+
+@client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     if before.roles == after.roles:
         return
     try:
         await enforce_single_rank_per_category(after)
-        await actualizar_apodo(after)
+        await actualizar_apodo(after)  # sigue el flujo borrar->calcular->cambiar
     except discord.Forbidden:
         print(f"No pude actualizar roles/apodo de {after} — jerarquía del bot insuficiente o es el dueño del servidor.")
     except discord.HTTPException as err:
@@ -308,15 +409,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @apodo_group.command(name="yo", description="Actualiza tu propio apodo según tus roles actuales")
 async def apodo_yo(interaction: discord.Interaction):
     member = interaction.user
-    nuevo = build_nickname(member)
-    if not nuevo:
-        await interaction.response.send_message(
-            "No tienes ningún rol operativo, de instructor o liderazgo — no hay prefijo que asignar.",
-            ephemeral=True,
-        )
-        return
     try:
-        await member.edit(nick=nuevo, reason="Actualización manual de apodo (/apodo yo)")
+        nuevo, cambio = await actualizar_apodo(member)
     except discord.Forbidden:
         await interaction.response.send_message(
             "No pude cambiarte el apodo — el bot no tiene permisos suficientes sobre tu rol más alto, "
@@ -324,7 +418,16 @@ async def apodo_yo(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    await interaction.response.send_message(f"Listo, tu apodo ahora es **{nuevo}**.", ephemeral=True)
+
+    if not nuevo:
+        await interaction.response.send_message(
+            "No tienes ningún rol operativo, de instructor o liderazgo — te dejé sin prefijo.",
+            ephemeral=True,
+        )
+    elif cambio:
+        await interaction.response.send_message(f"Listo, tu apodo ahora es **{nuevo}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Tu apodo ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
 @apodo_group.command(name="usuario", description="[Liderazgo/Staff] Actualiza el apodo de otro usuario según su jerarquía de roles")
@@ -334,22 +437,24 @@ async def apodo_usuario(interaction: discord.Interaction, miembro: discord.Membe
         await interaction.response.send_message("Este comando es solo para Liderazgo/Staff.", ephemeral=True)
         return
 
-    nuevo = build_nickname(miembro)
-    if not nuevo:
-        await interaction.response.send_message(
-            f"{miembro.mention} no tiene ningún rol operativo, de instructor o liderazgo.",
-            ephemeral=True,
-        )
-        return
     try:
-        await miembro.edit(nick=nuevo, reason=f"Actualización de apodo por {interaction.user}")
+        nuevo, cambio = await actualizar_apodo(miembro)
     except discord.Forbidden:
         await interaction.response.send_message(
             "No pude cambiar ese apodo — jerarquía de roles del bot insuficiente, o es el dueño del servidor.",
             ephemeral=True,
         )
         return
-    await interaction.response.send_message(f"Apodo de {miembro.mention} actualizado a **{nuevo}**.", ephemeral=True)
+
+    if not nuevo:
+        await interaction.response.send_message(
+            f"{miembro.mention} no tiene ningún rol operativo, de instructor o liderazgo — quedó sin prefijo.",
+            ephemeral=True,
+        )
+    elif cambio:
+        await interaction.response.send_message(f"Apodo de {miembro.mention} actualizado a **{nuevo}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"El apodo de {miembro.mention} ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
 @apodo_group.command(name="todos", description="[Solo dueño del server] Recalcula el apodo de todos los miembros")
@@ -363,15 +468,14 @@ async def apodo_todos(interaction: discord.Interaction):
     actualizados = 0
     fallidos = 0
     async for member in interaction.guild.fetch_members(limit=None):
-        nuevo = build_nickname(member)
-        if not nuevo or nuevo == member.display_name:
-            continue
         try:
-            await member.edit(nick=nuevo, reason=f"Recálculo masivo de apodos por {interaction.user}")
-            actualizados += 1
+            _, cambio = await actualizar_apodo(member)  # borrar -> calcular -> cambiar; no-op si ya está bien
         except (discord.Forbidden, discord.HTTPException):
             fallidos += 1
-        await asyncio.sleep(0.5)  # evitar rate limit de Discord al editar apodos en masa
+            continue
+        if cambio:
+            actualizados += 1
+            await asyncio.sleep(0.5)  # solo pausamos cuando de verdad hubo llamadas a la API
 
     await interaction.followup.send(
         f"Listo. Apodos actualizados: {actualizados}. No se pudieron cambiar: {fallidos} "
