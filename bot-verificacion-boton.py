@@ -220,26 +220,26 @@ def build_nickname(member: discord.Member):
 
 
 async def enforce_base_tags(member: discord.Member) -> bool:
-    """El rol base ATC (Controlador de Tráfico Aéreo) y FLT (Piloto) sigue
-    al rating real: si tiene cualquier rango de esa rama que NO sea el de
-    estudiante (ATO/APA), debe tener el rol base sí o sí; si no tiene
-    ningún rating de esa rama, no debe tenerlo. Devuelve True si cambió algo."""
+    """El rol base ATC (Controlador de Tráfico Aéreo) y FLT (Piloto) sigue a
+    la rama: si tiene cualquier rango de esa rama (desde estudiante ATO/APA
+    en adelante), debe tener el rol base sí o sí; si no tiene ningún rango
+    de esa rama, no debe tenerlo. Devuelve True si cambió algo."""
     role_ids = {r.id for r in member.roles}
 
-    tiene_rating_atc = any(rid in role_ids for rid in ATC_ORDER if rid != ATC_ORDER[-1])  # excluye ATO
-    tiene_rating_piloto = any(rid in role_ids for rid in PILOTO_ORDER if rid != PILOTO_ORDER[-1])  # excluye APA
+    tiene_rango_atc = any(rid in role_ids for rid in ATC_ORDER)
+    tiene_rango_piloto = any(rid in role_ids for rid in PILOTO_ORDER)
 
     a_agregar = []
     a_quitar = []
 
-    if tiene_rating_atc and ATC_ROLE_ID not in role_ids:
+    if tiene_rango_atc and ATC_ROLE_ID not in role_ids:
         a_agregar.append(ATC_ROLE_ID)
-    elif not tiene_rating_atc and ATC_ROLE_ID in role_ids:
+    elif not tiene_rango_atc and ATC_ROLE_ID in role_ids:
         a_quitar.append(ATC_ROLE_ID)
 
-    if tiene_rating_piloto and FLT_ROLE_ID not in role_ids:
+    if tiene_rango_piloto and FLT_ROLE_ID not in role_ids:
         a_agregar.append(FLT_ROLE_ID)
-    elif not tiene_rating_piloto and FLT_ROLE_ID in role_ids:
+    elif not tiene_rango_piloto and FLT_ROLE_ID in role_ids:
         a_quitar.append(FLT_ROLE_ID)
 
     if not a_agregar and not a_quitar:
@@ -505,20 +505,14 @@ async def on_member_join(member: discord.Member):
             print(f"ERROR: no encontré el canal de llegadas {LLEGADAS_CHANNEL_ID}")
         else:
             embed = discord.Embed(
-                title="¡Bienvenido a ATC24 Español! 🛫",
                 description=(
-                    f"{member.mention}, gracias por unirte a la comunidad de ATC24 en español.\n\n"
-                    "**¿Qué es esto?** Somos una comunidad de simulación de control de tráfico aéreo y "
-                    "vuelo, en base al juego ATC24 de Roblox.\n\n"
-                    "**Para empezar:**\n"
-                    "1️⃣ Completá tu verificación aceptando las reglas de la comunidad.\n"
-                    "2️⃣ Dale un vistazo al reglamento y la guía de roles del servidor.\n"
-                    "3️⃣ Revisá tus mensajes directos — te mandamos un mensaje para elegir tu rama "
-                    "(Piloto o Controlador de Tráfico Aéreo) y empezar tu formación en Academia.\n\n"
-                    "¡Que tengas un buen vuelo! ✈️"
+                    f"¡Hola {member.mention}! 👋\n"
+                    "¡Te damos la bienvenida a **ATC24 Español**! 🛫"
                 ),
                 color=discord.Color.blue(),
             )
+            if member.guild.icon:
+                embed.set_thumbnail(url=member.guild.icon.url)
             await canal.send(embed=embed)
 
     # El DM para elegir rama se manda recién cuando se verifica de verdad
@@ -528,10 +522,10 @@ async def on_member_join(member: discord.Member):
 
 async def _mandar_eleccion_de_rama_por_dm(member: discord.Member):
     embed_dm = discord.Embed(
-        title="Elegí tu rama en ATC24 Español",
+        title="Elige tu rama en ATC24 Español",
         description=(
-            "Cuando quieras, elegí por dónde arrancar tu camino en la red. "
-            "Esto te verifica en el servidor y te manda el link para inscribirte en Academia."
+            "Cuando quieras, elige por dónde comenzar tu camino en la red. "
+            "Esto te verifica en el servidor y te envía el enlace para inscribirte en Academia."
         ),
         color=discord.Color.blue(),
     )
@@ -542,8 +536,8 @@ async def _mandar_eleccion_de_rama_por_dm(member: discord.Member):
             canal = member.guild.get_channel(LLEGADAS_CHANNEL_ID)
             if canal is not None:
                 await canal.send(
-                    f"{member.mention} no pude mandarte un mensaje directo — abrí tus DMs a miembros del "
-                    "servidor y volvé a entrar, o pedile a un miembro de Staff que te ayude a elegir tu rama.",
+                    f"{member.mention} no fue posible enviarte un mensaje directo — abre tus mensajes directos "
+                    "a miembros del servidor e inténtalo de nuevo, o pide ayuda a un miembro del Staff para elegir tu rama.",
                 )
 
 
@@ -573,7 +567,7 @@ async def ascender(interaction: discord.Interaction, miembro: discord.Member, ra
 
     if not _puede_ascender(interaction.user, categoria):
         await interaction.response.send_message(
-            "No tienes permiso para otorgar ese rango (necesitás ser Instructor de esa rama o Liderazgo).",
+            "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Liderazgo).",
             ephemeral=True,
         )
         return
@@ -752,7 +746,7 @@ async def progreso(interaction: discord.Interaction):
 
 
 @tree.command(name="certificado", description="Muestra los certificados de un usuario en Academia")
-@app_commands.describe(miembro="Usuario a consultar (si lo dejás vacío, se muestra el tuyo)")
+@app_commands.describe(miembro="Usuario a consultar (si se deja vacío, se muestra el tuyo)")
 async def certificado(interaction: discord.Interaction, miembro: discord.Member = None):
     objetivo = miembro or interaction.user
     await interaction.response.defer()
