@@ -1,0 +1,13 @@
+# Nunca subas secretos al repo
+.env
+*.token
+
+# Entornos virtuales de Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db

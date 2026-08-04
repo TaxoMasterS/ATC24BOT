@@ -1,0 +1,64 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 2872707,
+      "components": [
+        {
+          "type": 10,
+          "content": "# <:Verificado:1534081412536205422> VERIFICACIÓN DE ACEPTACIÓN DE REGLAS"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 2
+        },
+        {
+          "type": 10,
+          "content": "Antes de acceder por completo a **ATC24 Español**, debes confirmar formalmente que conoces y aceptas nuestras normas."
+        },
+        {
+          "type": 10,
+          "content": "**Al presionar el botón de abajo, declaras que:**\n\n1. Has leído y aceptas el **Reglamento de la Comunidad** en su totalidad.\n2. Aceptas los **Términos de Servicio** de ATC24 Español.\n3. Has leído la **Política de Privacidad** y entiendes qué datos manejamos.\n4. Has leído el **Descargo de Responsabilidad** y entiendes la naturaleza de simulación de esta comunidad."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "```fix\nAl confirmar:\n  Se te retira el rol NV | No Verificado\n  Se te otorga el rol  V | Verificado\n```"
+        },
+        {
+          "type": 10,
+          "content": "-# No leer las reglas no te exime de cumplirlas. Confirmar sin haber leído el Reglamento puede derivar en sanciones si incumples una norma que este botón declara que ya conoces."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 3,
+              "label": "Acepto y confirmo",
+              "emoji": {
+                "name": "Check",
+                "id": "1534080132526903369"
+              },
+              "custom_id": "atc24_verificar_aceptacion"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
