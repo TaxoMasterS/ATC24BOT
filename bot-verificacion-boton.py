@@ -147,8 +147,10 @@ GC_ORDER = [
 ]
 
 # Categorías con "un solo rango a la vez" — se les aplica auto-limpieza.
+# Liderazgo NO va acá: sus roles se pueden combinar libremente (alguien puede
+# ser DEV + STF + PM a la vez); LIDERAZGO_ORDER solo define cuál se muestra
+# primero en el apodo cuando tiene varios, no cuáles puede tener asignados.
 RANKED_CATEGORIES = {
-    "LIDERAZGO": LIDERAZGO_ORDER,
     "ATC": ATC_ORDER,
     "PILOTO": PILOTO_ORDER,
     "GC": GC_ORDER,
