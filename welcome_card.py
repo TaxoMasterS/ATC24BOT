@@ -27,9 +27,9 @@ FUENTE_CUSTOM_PATH = os.path.join(CARPETA_ASSETS, "fuente_bienvenida.ttf")
 # ~62% del alto. Se recalculan sobre el tamaño real del fondo que se cargue,
 # así que da igual si el PNG final tiene otra resolución.
 AVATAR_CENTRO_X_FRAC = 0.50
-AVATAR_CENTRO_Y_FRAC = 0.24
+AVATAR_CENTRO_Y_FRAC = 0.30
 AVATAR_RADIO_FRAC = 0.19
-TEXTO_Y_FRAC = 0.62
+TEXTO_Y_FRAC = 0.66
 
 
 def _cargar_fuente(tamano: int) -> ImageFont.FreeTypeFont:
@@ -83,7 +83,7 @@ async def generar_tarjeta_bienvenida(member) -> io.BytesIO:
     fondo.paste(avatar_circular, pos_avatar, avatar_circular)
 
     draw = ImageDraw.Draw(fondo)
-    texto = "{" + member.display_name + "}"
+    texto = member.display_name
     tamano_fuente = int(alto * 0.13)
     fuente = _cargar_fuente(tamano_fuente)
 

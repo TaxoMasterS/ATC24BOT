@@ -331,7 +331,31 @@ async def _consulta_web(ruta: str, params: dict = None) -> dict:
             return await resp.json()
 
 
-BRANCH_LABEL = {"atc": "ATC", "pilot": "Piloto"}
+BRANCH_LABEL = {"atc": "🛫 ATC", "pilot": "✈️ Piloto"}
+BRANCH_ORDER = ["atc", "pilot"]
+
+COURSE_STATE_LABEL = {
+    "locked": "🔒 Bloqueado",
+    "in_progress": "📘 En progreso",
+    "theory_done": "📗 Teoría completada",
+    "completed": "✅ Completado",
+}
+EVAL_STATE_LABEL = {
+    "locked": "Evaluación bloqueada",
+    "available": "Evaluación disponible",
+    "pending": "⏳ Evaluación en revisión",
+    "approved": "✅ Evaluación aprobada",
+    "rejected": "❌ Evaluación rechazada",
+}
+CERT_TYPE_LABEL = {"final": "🏅 Certificado final", "theory": "📄 Certificado de teoría"}
+CERT_TYPE_ORDEN = {"final": 0, "theory": 1}
+
+
+def _agrupar_por_rama(items: list, campo_rama: str = "branch") -> dict:
+    grupos = {b: [] for b in BRANCH_ORDER}
+    for it in items:
+        grupos.setdefault(it.get(campo_rama), []).append(it)
+    return grupos
 
 
 async def _certificado_en_rama(discord_id: str, branch: str) -> bool:
@@ -747,21 +771,36 @@ async def progreso(interaction: discord.Interaction):
         await interaction.followup.send(f"No pude consultar tu progreso: {err}", ephemeral=True)
         return
 
-    embed = discord.Embed(title="Tu progreso en Academia", color=discord.Color.blurple())
+    embed = discord.Embed(title="📚 Tu progreso en Academia", color=discord.Color.blurple())
 
     if not data.get("enrollments"):
-        embed.description = "Todavía no te inscribiste en ninguna rama de Academia."
-    for curso in data.get("courseProgress", []):
-        estado = f"{curso['state']}" + (f" · examen: {curso['evalState']}" if curso.get("evalState") else "")
-        embed.add_field(
-            name=f"{BRANCH_LABEL.get(curso['branch'], curso['branch'])} — {curso['courseTitle']}",
-            value=estado,
-            inline=False,
-        )
-    certs = data.get("certificates", [])
-    if certs:
-        texto = "\n".join(f"🏅 {c['courseTitle']} ({c['type']})" for c in certs)
-        embed.add_field(name="Certificados", value=texto, inline=False)
+        embed.description = "Todavía no te inscribiste en ninguna rama de Academia. Elige tu rama desde el mensaje que recibiste por mensaje directo al verificarte."
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    cursos_por_rama = _agrupar_por_rama(data.get("courseProgress", []))
+    for rama in BRANCH_ORDER:
+        cursos = cursos_por_rama.get(rama, [])
+        if not cursos:
+            continue
+        lineas = []
+        for curso in cursos:
+            estado = COURSE_STATE_LABEL.get(curso["state"], curso["state"])
+            eval_estado = EVAL_STATE_LABEL.get(curso.get("evalState"), None)
+            linea = f"**{curso['courseTitle']}** — {estado}"
+            if eval_estado:
+                linea += f"\n{eval_estado}"
+            lineas.append(linea)
+        embed.add_field(name=BRANCH_LABEL[rama], value="\n\n".join(lineas), inline=False)
+
+    certs = sorted(data.get("certificates", []), key=lambda c: CERT_TYPE_ORDEN.get(c["type"], 9))
+    certs_por_rama = _agrupar_por_rama(certs)
+    for rama in BRANCH_ORDER:
+        items = certs_por_rama.get(rama, [])
+        if not items:
+            continue
+        texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']}" for c in items)
+        embed.add_field(name=f"{BRANCH_LABEL[rama]} · Certificados", value=texto, inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -782,13 +821,17 @@ async def certificado(interaction: discord.Interaction, miembro: discord.Member 
         await interaction.followup.send(f"{objetivo.mention} todavía no tiene certificados en Academia.")
         return
 
-    embed = discord.Embed(title=f"Certificados de {objetivo.display_name}", color=discord.Color.gold())
-    for c in items:
-        embed.add_field(
-            name=f"{BRANCH_LABEL.get(c['branch'], c['branch'])} — {c['courseTitle']}",
-            value=f"{c['type']} · {c['issuedAt']}",
-            inline=False,
-        )
+    items = sorted(items, key=lambda c: CERT_TYPE_ORDEN.get(c["type"], 9))
+    por_rama = _agrupar_por_rama(items)
+
+    embed = discord.Embed(title=f"🎓 Certificados de {objetivo.display_name}", color=discord.Color.gold())
+    for rama in BRANCH_ORDER:
+        certs = por_rama.get(rama, [])
+        if not certs:
+            continue
+        texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']} ({c['issuedAt']})" for c in certs)
+        embed.add_field(name=BRANCH_LABEL[rama], value=texto, inline=False)
+
     await interaction.followup.send(embed=embed)
 
 
@@ -816,11 +859,17 @@ async def cola(interaction: discord.Interaction, rama: app_commands.Choice[str] 
         await interaction.followup.send("No hay evaluaciones pendientes ahora mismo. 🎉", ephemeral=True)
         return
 
-    texto = "\n".join(
-        f"• **{it['username']}** — {BRANCH_LABEL.get(it['branch'], it['branch'])} · {it['courseTitle']} ({it['evalState']})"
-        for it in items
-    )
-    embed = discord.Embed(title="Evaluaciones pendientes", description=texto, color=discord.Color.orange())
+    por_rama = _agrupar_por_rama(items)
+    embed = discord.Embed(title="📋 Evaluaciones pendientes de revisar", color=discord.Color.orange())
+    for r in BRANCH_ORDER:
+        pendientes = por_rama.get(r, [])
+        if not pendientes:
+            continue
+        texto = "\n".join(
+            f"• **{it['username']}** — {it['courseTitle']} ({EVAL_STATE_LABEL.get(it['evalState'], it['evalState'])})"
+            for it in pendientes
+        )
+        embed.add_field(name=BRANCH_LABEL[r], value=texto, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
