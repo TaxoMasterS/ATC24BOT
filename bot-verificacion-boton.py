@@ -71,6 +71,8 @@ import discord
 from discord import app_commands
 from aiohttp import web
 
+from welcome_card import generar_tarjeta_bienvenida
+
 CARPETA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────────────────────
@@ -378,7 +380,17 @@ async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama:
     esos roles base solo se otorgan cuando tiene un rating real (ver
     enforce_base_tags), y el rol de estudiante (ATO/APA) lo otorga la propia
     web al completar la inscripción en Academia."""
-    guild = interaction.guild
+    # El botón se manda por DM, así que interaction.guild siempre es None acá
+    # (los DM no tienen servidor asociado) — hay que buscar el servidor real
+    # por ID en vez de asumir que la interacción trae uno.
+    guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
+    if guild is None:
+        await interaction.response.send_message(
+            "No pude identificar el servidor de ATC24 Español. Avisa al staff.", ephemeral=True,
+        )
+        print("ERROR: GUILD_ID no está configurado o el bot no está en ese servidor.")
+        return
+
     member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
 
     v_role = guild.get_role(V_ROLE_ID)
@@ -408,12 +420,9 @@ async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama:
         "y empezar tu formación real (examen de admisión, lecciones, evaluación final)."
     )
 
-    try:
-        await member.send(mensaje)
-        await interaction.response.send_message("Te mandé los detalles por mensaje directo 📬", ephemeral=True)
-    except discord.Forbidden:
-        # Tiene los DMs cerrados — respondemos acá mismo como respaldo.
-        await interaction.response.send_message(mensaje, ephemeral=True)
+    # El botón ya vive dentro del DM, así que respondemos directo a la
+    # interacción con el mensaje real (no hace falta mandar un DM aparte).
+    await interaction.response.send_message(mensaje)
 
 
 class BienvenidaView(discord.ui.View):
@@ -504,16 +513,26 @@ async def on_member_join(member: discord.Member):
         if canal is None:
             print(f"ERROR: no encontré el canal de llegadas {LLEGADAS_CHANNEL_ID}")
         else:
-            embed = discord.Embed(
-                description=(
-                    f"¡Hola {member.mention}! 👋\n"
-                    "¡Te damos la bienvenida a **ATC24 Español**! 🛫"
-                ),
-                color=discord.Color.blue(),
+            saludo = f"¡Hola {member.mention}! 👋\n¡Te damos la bienvenida a **ATC24 Español**! 🛫"
+            texto_bienvenida = (
+                f"Bienvenido a **ATC24 Español**, {member.mention}. Gracias por unirte a nuestra comunidad.\n\n"
+                "Para comenzar, te invitamos a leer nuestros documentos y reglamento, y a completar tu "
+                "verificación en el canal correspondiente.\n\n"
+                "Esperamos que disfrutes tu estadía y aproveches al máximo la experiencia dentro del servidor."
             )
-            if member.guild.icon:
-                embed.set_thumbnail(url=member.guild.icon.url)
-            await canal.send(embed=embed)
+            try:
+                tarjeta = await generar_tarjeta_bienvenida(member)
+                archivo = discord.File(tarjeta, filename="bienvenida.png")
+                embed = discord.Embed(description=saludo, color=discord.Color.blue())
+                embed.set_image(url="attachment://bienvenida.png")
+                await canal.send(embed=embed, file=archivo)
+            except FileNotFoundError as err:
+                print(f"Aviso: {err} — mando la bienvenida sin tarjeta por ahora.")
+                embed = discord.Embed(description=saludo, color=discord.Color.blue())
+                if member.guild.icon:
+                    embed.set_thumbnail(url=member.guild.icon.url)
+                await canal.send(embed=embed)
+            await canal.send(texto_bienvenida)
 
     # El DM para elegir rama se manda recién cuando se verifica de verdad
     # (aprieta "Acepto y confirmo" en el mensaje de !publicar-verificacion),
