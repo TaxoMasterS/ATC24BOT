@@ -31,12 +31,12 @@ REQUISITOS ANTES DE CORRERLO
      Windows (PowerShell):  $env:DISCORD_BOT_TOKEN="tu_token_aqui"
      Linux/Mac/VPS:          export DISCORD_BOT_TOKEN="tu_token_aqui"
 
-5. Asegúrate de que "verificacion-boton-components-v2.json" esté en
-   la misma carpeta que este script.
+5. Asegúrate de que la carpeta "payloads/" (con verificacion.json y
+   guia.json) esté junto a este script.
 
 CÓMO PUBLICAR EL MENSAJE
 -------------------------
-Corre el bot normalmente (python bot-verificacion-boton.py). Una vez
+Corre el bot normalmente (python bot.py). Una vez
 conectado, escribe en el canal donde quieres el botón:
 
     !publicar-verificacion
@@ -108,8 +108,8 @@ LLEGADAS_CHANNEL_ID = 1238796825415389294
 CUSTOM_ID = "atc24_verificar_aceptacion"
 CUSTOM_ID_PILOTO = "atc24_bienvenida_piloto"
 CUSTOM_ID_ATC = "atc24_bienvenida_atc"
-ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "verificacion-boton-components-v2.json")
-ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "guia-web-bot-components-v2.json")
+ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "payloads", "verificacion.json")
+ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "payloads", "guia.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
 # Cada lista va del rango MÁS ALTO al más bajo dentro de su categoría.
@@ -550,7 +550,9 @@ async def iniciar_servidor_web():
 
 
 _presencia_iniciada = False  # evita arrancar el loop dos veces si on_ready se dispara de nuevo (reconexión)
-_BOT_START_TIME = datetime.datetime.now(datetime.timezone.utc)  # fijo — no se reinicia en cada refresco
+# Unix epoch en milisegundos — formato que espera Discord en timestamps.start
+# (documentado), más seguro que pasar un datetime como kwarg suelto.
+_BOT_START_MS = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
 
 
 async def _actualizar_presencia_loop():
@@ -558,10 +560,12 @@ async def _actualizar_presencia_loop():
         try:
             data = await _consulta_web("/api/bot/live-counts")
             texto = f"{data.get('activeFlights', 0)} vuelos · {data.get('activeControllers', 0)} controladores"
-            # start=_BOT_START_TIME hace que Discord muestre "hace X tiempo" y lo
+            # timestamps.start hace que Discord muestre "hace X tiempo" y lo
             # vaya actualizando solo en el cliente de cada usuario — no hace
             # falta que nosotros recalculemos ningún texto de tiempo a mano.
-            actividad = discord.Activity(type=discord.ActivityType.watching, name=texto, start=_BOT_START_TIME)
+            actividad = discord.Activity(
+                type=discord.ActivityType.watching, name=texto, timestamps={"start": _BOT_START_MS},
+            )
             await client.change_presence(activity=actividad)
         except Exception as err:
             print(f"Aviso: no pude actualizar el rich presence: {err}")
@@ -587,6 +591,8 @@ async def setup_hook():
     await iniciar_servidor_web()
 
     client.add_view(BienvenidaView())  # persistente: sobrevive a reinicios del bot
+
+    tree.add_command(academia_group)
 
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
@@ -677,7 +683,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         print(f"Error de Discord actualizando a {after}: {err}")
 
 
-@tree.command(name="ascender", description="[Instructor/Liderazgo] Otorga un rango a un usuario")
+@tree.command(name="ascender", description="Otorga un rango a un usuario")
 @app_commands.describe(miembro="Usuario a ascender", rango="Rango a otorgar")
 @app_commands.choices(rango=RANGO_CHOICES)
 async def ascender(interaction: discord.Interaction, miembro: discord.Member, rango: app_commands.Choice[str]):
@@ -757,7 +763,7 @@ async def apodo(interaction: discord.Interaction):
         await interaction.response.send_message(f"Tu apodo ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@tree.command(name="apodo-miembro", description="[Liderazgo/Staff] Actualiza el apodo de otro usuario según su jerarquía de roles")
+@tree.command(name="apodo-miembro", description="Actualiza el apodo de otro usuario según su jerarquía de roles")
 @app_commands.describe(miembro="Usuario a actualizar")
 async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
@@ -784,7 +790,7 @@ async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Membe
         await interaction.response.send_message(f"El apodo de {miembro.mention} ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@tree.command(name="apodo-todos", description="[Solo dueño del server] Recalcula el apodo de todos los miembros")
+@tree.command(name="apodo-todos", description="Recalcula el apodo de todos los miembros")
 async def apodo_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -811,7 +817,7 @@ async def apodo_todos(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="apodo-borrartodos", description="[Solo dueño del server] Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
+@tree.command(name="apodo-borrartodos", description="Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
 async def apodo_borrar_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -839,8 +845,11 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="progreso", description="Muestra tu progreso en Academia (cursos, evaluaciones, certificados)")
-async def progreso(interaction: discord.Interaction):
+academia_group = app_commands.Group(name="academia", description="Comandos de Academia: progreso, certificados y cola de evaluaciones")
+
+
+@academia_group.command(name="progreso", description="Muestra tu progreso en Academia (cursos, evaluaciones, certificados)")
+async def academia_progreso(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         data = await _consulta_web(f"/api/bot/user-progress/{interaction.user.id}")
@@ -882,9 +891,9 @@ async def progreso(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="certificado", description="Muestra los certificados de un usuario en Academia")
+@academia_group.command(name="certificado", description="Muestra los certificados de un usuario en Academia")
 @app_commands.describe(miembro="Usuario a consultar (si se deja vacío, se muestra el tuyo)")
-async def certificado(interaction: discord.Interaction, miembro: discord.Member = None):
+async def academia_certificado(interaction: discord.Interaction, miembro: discord.Member = None):
     objetivo = miembro or interaction.user
     await interaction.response.defer()
     try:
@@ -912,13 +921,13 @@ async def certificado(interaction: discord.Interaction, miembro: discord.Member 
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="cola", description="[Instructor/Liderazgo] Muestra las evaluaciones pendientes de revisar")
+@academia_group.command(name="cola", description="Muestra las evaluaciones pendientes de revisar")
 @app_commands.describe(rama="Filtrar por rama (dejalo vacío para ver ambas)")
 @app_commands.choices(rama=[
     app_commands.Choice(name="ATC", value="atc"),
     app_commands.Choice(name="Piloto", value="pilot"),
 ])
-async def cola(interaction: discord.Interaction, rama: app_commands.Choice[str] = None):
+async def academia_cola(interaction: discord.Interaction, rama: app_commands.Choice[str] = None):
     es_instructor = has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER)
     if not es_instructor:
         await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
@@ -950,36 +959,52 @@ async def cola(interaction: discord.Interaction, rama: app_commands.Choice[str] 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="eco", description="[Liderazgo/Staff] Manda un mensaje formal como el bot (a un canal o por MD)")
+class EcoModal(discord.ui.Modal, title="Mandar mensaje"):
+    def __init__(self, destino):
+        super().__init__()
+        self.destino = destino
+
+    texto = discord.ui.TextInput(
+        label="Mensaje (admite markdown completo)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Escribe el mensaje tal como quieres que se vea, incluido markdown…",
+        max_length=4000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await self.destino.send(str(self.texto))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "No pude mandar el mensaje ahí — el bot no tiene permisos, o el usuario tiene los MD cerrados.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(f"Mensaje enviado a {self.destino.mention}. ✅", ephemeral=True)
+        print(f"{interaction.user} usó /eco hacia {self.destino}")
+
+
+@tree.command(name="eco", description="Manda un mensaje formal como el bot (a un canal, por MD, o en el mismo canal)")
 @app_commands.describe(
-    mensaje="Texto a enviar",
-    canal="Canal donde publicarlo (dejalo vacío si vas a mandarlo por MD)",
-    usuario="Usuario a quien mandárselo por MD (dejalo vacío si vas a publicarlo en un canal)",
+    canal="Canal donde publicarlo (si se deja vacío junto con usuario, se manda en este mismo canal)",
+    usuario="Usuario a quien mandárselo por MD",
 )
 async def eco(
     interaction: discord.Interaction,
-    mensaje: str,
     canal: discord.TextChannel = None,
     usuario: discord.Member = None,
 ):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
         await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
         return
-    if bool(canal) == bool(usuario):  # ninguno de los dos, o los dos a la vez
-        await interaction.response.send_message("Elegí exactamente uno: un canal O un usuario, no ambos ni ninguno.", ephemeral=True)
+    if canal and usuario:
+        await interaction.response.send_message("Elegí solo uno: un canal O un usuario, no ambos.", ephemeral=True)
         return
 
-    destino = canal or usuario
-    try:
-        await destino.send(mensaje)
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "No pude mandar el mensaje ahí — el bot no tiene permisos, o el usuario tiene los MD cerrados.",
-            ephemeral=True,
-        )
-        return
-    await interaction.response.send_message(f"Mensaje enviado a {destino.mention}. ✅", ephemeral=True)
-    print(f"{interaction.user} usó /eco hacia {'#' + canal.name if canal else usuario} : {mensaje[:80]}")
+    # Si no se especifica nada, se manda en el mismo canal donde se ejecutó el comando.
+    destino = usuario or canal or interaction.channel
+    await interaction.response.send_modal(EcoModal(destino))
 
 
 async def _publicar_payload_crudo(channel_id: int, payload: dict):

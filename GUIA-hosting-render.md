@@ -39,7 +39,7 @@ Si el repo aún no tiene remoto configurado (`git remote -v` no muestra nada), p
    - **Branch**: `main`
    - **Runtime**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python bot-verificacion-boton.py`
+   - **Start Command**: `python bot.py`
    - **Instance Type**: **Free**
 5. En **Environment Variables**, agrega:
    - Key: `DISCORD_BOT_TOKEN` → Value: tu token real del bot
