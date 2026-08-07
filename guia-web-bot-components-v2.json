@@ -1,0 +1,84 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 2872707,
+      "components": [
+        {
+          "type": 10,
+          "content": "# <:libro:1534075380405764227> GUÍA — CÓMO USAR LA WEB Y EL BOT DE ATC24 ESPAÑOL"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 2
+        },
+        {
+          "type": 10,
+          "content": "## <:Check:1534080132526903369> 1. Verificación\n\nAl unirte se te asigna el rol **NV | No Verificado**. Presiona **\"Acepto y confirmo\"** en el mensaje de verificación para aceptar las reglas — se te da el rol **V | Verificado**, y te llega un mensaje directo para elegir tu rama."
+        },
+        {
+          "type": 10,
+          "content": "## <:Avion:1534071045865341019> 2. Elegí tu rama\n\nEn el mensaje directo, elegí **Piloto** o **Controlador de Tráfico Aéreo (ATC)**. Esto no te da ningún rango todavía — solo te manda el link para inscribirte en Academia."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:ATC:1534071009060061214> 3. Academia\n\nEntrá a **atc24espanol.lat/academia/pilotos** o **/academia/atc** y completá tu inscripción (examen de admisión). Cuando un instructor la apruebe, recibís el rol de **estudiante** (ATO o APA) automáticamente."
+        },
+        {
+          "type": 10,
+          "content": "Después seguís tus lecciones y evaluaciones en la web. Podés consultar tu progreso en cualquier momento con **/progreso**, y tus certificados con **/certificado**."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:brujula:1534077767958663329> 4. Rangos y apodo\n\nCuando completás tu formación y un instructor te asciende (con **/ascender**), obtenés tu primer rango real (S1 para ATC, PPA para Piloto) — junto con tu rol base (**ATC** o **FLT**). Tu apodo se actualiza solo, siguiendo la guía oficial de prefijos. Si alguna vez lo ves mal, usá **/apodo**."
+        },
+        {
+          "type": 10,
+          "content": "```fix\nJerarquía y prefijos:\n  Liderazgo / Instructor van primero (si tenés)\n  Después tu rango operativo más alto\n  Máximo 2 prefijos, formato PREFIJO | Nombre\n```"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:antena:1534070807792324659> 5. Operando en Red/Torre\n\nAbrí una posición ATC desde la web (**Red → Torre**) — se crea sola una categoría de Discord con el ICAO del aeródromo, con un canal UNICOM fijo y un canal por tu posición. Presentá tus planes de vuelo desde **Red → Operaciones**."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:chat:1534077571279360141> Comandos útiles del bot\n\n**/apodo** — recalcula tu propio apodo\n**/progreso** — tu avance en Academia\n**/certificado [usuario]** — certificados obtenidos\n**/cola** — evaluaciones pendientes (Instructores/Liderazgo)\n**/ascender** — otorgar un rango (Instructores/Liderazgo)\n**/eco** — mandar un mensaje formal a nombre del bot (Liderazgo/Staff)"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "-# ¿Dudas que esta guía no responde? Preguntale a Staff en los canales correspondientes."
+        }
+      ]
+    }
+  ]
+}

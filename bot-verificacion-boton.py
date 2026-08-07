@@ -63,6 +63,7 @@ GUIA-hosting-render.md para el paso a paso completo.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 
@@ -90,6 +91,12 @@ GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 WEB_API_BASE = os.environ.get("WEB_API_BASE", "https://atc24espanol.lat")
 BOT_SHARED_SECRET = os.environ.get("BOT_SHARED_SECRET")
 
+# API key de Bloxlink (dashboard de Bloxlink → tu servidor → API). Se usa
+# para leer el nombre REAL de Roblox ya verificado y usarlo como base del
+# apodo, en vez del username de Discord. Si no está configurada, el apodo
+# sigue funcionando igual mostrando el nombre de Discord (no rompe nada).
+BLOXLINK_API_KEY = os.environ.get("BLOXLINK_API_KEY")
+
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
 
@@ -102,6 +109,7 @@ CUSTOM_ID = "atc24_verificar_aceptacion"
 CUSTOM_ID_PILOTO = "atc24_bienvenida_piloto"
 CUSTOM_ID_ATC = "atc24_bienvenida_atc"
 ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "verificacion-boton-components-v2.json")
+ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "guia-web-bot-components-v2.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
 # Cada lista va del rango MÁS ALTO al más bajo dentro de su categoría.
@@ -195,10 +203,45 @@ def _strip_prefix(nombre: str) -> str:
     return nombre
 
 
-def build_nickname(member: discord.Member):
+_bloxlink_cache = {}  # discord_id -> (nombre_roblox, expira_en)
+BLOXLINK_CACHE_TTL = 300  # 5 minutos — evita golpear la API de Bloxlink en /apodo-todos
+
+
+async def _roblox_username(discord_id: int):
+    """Nombre real de Roblox ya verificado en Bloxlink para este Discord ID,
+    o None si no está configurado / no se pudo resolver (nunca rompe el
+    cálculo del apodo — solo cae a usar el nombre de Discord)."""
+    if not BLOXLINK_API_KEY or not GUILD_ID:
+        return None
+    ahora = asyncio.get_running_loop().time()
+    cacheado = _bloxlink_cache.get(discord_id)
+    if cacheado and cacheado[1] > ahora:
+        return cacheado[0]
+    url = f"https://api.blox.link/v4/public/guilds/{GUILD_ID}/discord-to-roblox/{discord_id}"
+    headers = {"Authorization": BLOXLINK_API_KEY}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception as err:
+        print(f"Aviso: no pude consultar Bloxlink para {discord_id}: {err}")
+        return None
+    resolved = (data or {}).get("resolved") or {}
+    roblox = resolved.get("roblox") or {}
+    nombre = roblox.get("name") or roblox.get("displayName")
+    if nombre:
+        _bloxlink_cache[discord_id] = (nombre, ahora + BLOXLINK_CACHE_TTL)
+    return nombre
+
+
+def build_nickname(member: discord.Member, base_name: str = None):
     """Calcula el apodo con prefijo según la guía de jerarquía. Devuelve
     None si el miembro no tiene ningún rol de instructor/liderazgo/rango
-    operativo (no hay nada que anteponer)."""
+    operativo (no hay nada que anteponer). `base_name` permite pasar el
+    nombre real de Roblox (Bloxlink) en vez de derivarlo del apodo actual de
+    Discord — ver build_nickname_async()."""
     role_ids = {r.id for r in member.roles}
 
     instructor = _highest(role_ids, INSTRUCTOR_ORDER)
@@ -219,8 +262,16 @@ def build_nickname(member: discord.Member):
         return None
 
     prefijo = " / ".join(PREFIX_LABELS[rid] for rid in slots)
-    base_name = _strip_prefix(member.display_name)
-    return f"{prefijo} | {base_name}"
+    nombre_base = base_name if base_name is not None else _strip_prefix(member.display_name)
+    return f"{prefijo} | {nombre_base}"
+
+
+async def build_nickname_async(member: discord.Member):
+    """Versión que prioriza el nombre real de Roblox (Bloxlink) como base
+    del apodo, con fallback automático al nombre de Discord."""
+    roblox_name = await _roblox_username(member.id)
+    base = roblox_name if roblox_name else _strip_prefix(member.display_name)
+    return build_nickname(member, base_name=base)
 
 
 async def enforce_base_tags(member: discord.Member) -> bool:
@@ -373,27 +424,31 @@ RANGO_CHOICES = [
 ]
 
 
-def _target_nickname(member: discord.Member):
+async def _target_nickname(member: discord.Member):
     """Nombre final que debería tener el miembro: con prefijo si le
     corresponde, o su nombre limpio (sin prefijo) si no tiene ningún rol
-    que lo amerite."""
-    nuevo = build_nickname(member)
-    return nuevo if nuevo is not None else _strip_prefix(member.display_name)
+    que lo amerite. Ya usa el nombre real de Roblox (Bloxlink) si está
+    disponible."""
+    nuevo = await build_nickname_async(member)
+    if nuevo is not None:
+        return nuevo
+    roblox_name = await _roblox_username(member.id)
+    return roblox_name if roblox_name else _strip_prefix(member.display_name)
 
 
 async def actualizar_apodo(member: discord.Member):
     """Sigue el flujo pedido: BORRAR apodo actual -> CALCULAR el nuevo ->
     CAMBIAR. Si el miembro ya tiene exactamente el apodo que le corresponde,
     no hace ninguna llamada a la API (evita rate-limit innecesario en
-    /apodo todos). Devuelve (nombre_final, hubo_cambio)."""
-    objetivo = _target_nickname(member)
+    /apodo-todos). Devuelve (nombre_final, hubo_cambio)."""
+    objetivo = await _target_nickname(member)
     if objetivo == member.display_name:
         return objetivo, False
 
     if member.nick is not None:
         await member.edit(nick=None, reason="Actualización de apodo — paso 1/2: borrar")
 
-    nuevo = build_nickname(member)
+    nuevo = await build_nickname_async(member)
     if nuevo:
         await member.edit(nick=nuevo, reason="Actualización de apodo — paso 2/2: cambiar")
 
@@ -476,7 +531,6 @@ intents.members = True  # necesario para poder modificar roles de miembros
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-apodo_group = app_commands.Group(name="apodo", description="Gestión de apodos según la jerarquía de roles de ATC24 Español")
 
 
 async def _ping(_request):
@@ -495,11 +549,35 @@ async def iniciar_servidor_web():
     print(f"Mini servidor web escuchando en el puerto {PORT} (para Render/UptimeRobot).")
 
 
+_presencia_iniciada = False  # evita arrancar el loop dos veces si on_ready se dispara de nuevo (reconexión)
+_BOT_START_TIME = datetime.datetime.now(datetime.timezone.utc)  # fijo — no se reinicia en cada refresco
+
+
+async def _actualizar_presencia_loop():
+    while True:
+        try:
+            data = await _consulta_web("/api/bot/live-counts")
+            texto = f"{data.get('activeFlights', 0)} vuelos · {data.get('activeControllers', 0)} controladores"
+            # start=_BOT_START_TIME hace que Discord muestre "hace X tiempo" y lo
+            # vaya actualizando solo en el cliente de cada usuario — no hace
+            # falta que nosotros recalculemos ningún texto de tiempo a mano.
+            actividad = discord.Activity(type=discord.ActivityType.watching, name=texto, start=_BOT_START_TIME)
+            await client.change_presence(activity=actividad)
+        except Exception as err:
+            print(f"Aviso: no pude actualizar el rich presence: {err}")
+        await asyncio.sleep(120)  # cada 2 minutos — suficiente para que se sienta "en vivo" sin saturar la web
+
+
 @client.event
 async def on_ready():
     print(f"Conectado como {client.user} (id {client.user.id})")
     print("Esperando el comando !publicar-verificacion en algún canal…")
     print("El bot debe seguir corriendo para poder reaccionar a los clics del botón.\n")
+
+    global _presencia_iniciada
+    if not _presencia_iniciada:
+        _presencia_iniciada = True
+        client.loop.create_task(_actualizar_presencia_loop())
 
 
 @client.event
@@ -510,7 +588,6 @@ async def setup_hook():
 
     client.add_view(BienvenidaView())  # persistente: sobrevive a reinicios del bot
 
-    tree.add_command(apodo_group)
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
         tree.copy_global_to(guild=guild_obj)
@@ -656,8 +733,8 @@ async def ascender(interaction: discord.Interaction, miembro: discord.Member, ra
     )
 
 
-@apodo_group.command(name="yo", description="Actualiza tu propio apodo según tus roles actuales")
-async def apodo_yo(interaction: discord.Interaction):
+@tree.command(name="apodo", description="Actualiza tu propio apodo según tus roles actuales")
+async def apodo(interaction: discord.Interaction):
     member = interaction.user
     try:
         nuevo, cambio = await actualizar_apodo(member)
@@ -680,9 +757,9 @@ async def apodo_yo(interaction: discord.Interaction):
         await interaction.response.send_message(f"Tu apodo ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@apodo_group.command(name="usuario", description="[Liderazgo/Staff] Actualiza el apodo de otro usuario según su jerarquía de roles")
+@tree.command(name="apodo-miembro", description="[Liderazgo/Staff] Actualiza el apodo de otro usuario según su jerarquía de roles")
 @app_commands.describe(miembro="Usuario a actualizar")
-async def apodo_usuario(interaction: discord.Interaction, miembro: discord.Member):
+async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
         await interaction.response.send_message("Este comando es solo para Liderazgo/Staff.", ephemeral=True)
         return
@@ -707,7 +784,7 @@ async def apodo_usuario(interaction: discord.Interaction, miembro: discord.Membe
         await interaction.response.send_message(f"El apodo de {miembro.mention} ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@apodo_group.command(name="todos", description="[Solo dueño del server] Recalcula el apodo de todos los miembros")
+@tree.command(name="apodo-todos", description="[Solo dueño del server] Recalcula el apodo de todos los miembros")
 async def apodo_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -734,7 +811,7 @@ async def apodo_todos(interaction: discord.Interaction):
     )
 
 
-@apodo_group.command(name="borrartodos", description="[Solo dueño del server] Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
+@tree.command(name="apodo-borrartodos", description="[Solo dueño del server] Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
 async def apodo_borrar_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -873,6 +950,38 @@ async def cola(interaction: discord.Interaction, rama: app_commands.Choice[str] 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@tree.command(name="eco", description="[Liderazgo/Staff] Manda un mensaje formal como el bot (a un canal o por MD)")
+@app_commands.describe(
+    mensaje="Texto a enviar",
+    canal="Canal donde publicarlo (dejalo vacío si vas a mandarlo por MD)",
+    usuario="Usuario a quien mandárselo por MD (dejalo vacío si vas a publicarlo en un canal)",
+)
+async def eco(
+    interaction: discord.Interaction,
+    mensaje: str,
+    canal: discord.TextChannel = None,
+    usuario: discord.Member = None,
+):
+    if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
+        return
+    if bool(canal) == bool(usuario):  # ninguno de los dos, o los dos a la vez
+        await interaction.response.send_message("Elegí exactamente uno: un canal O un usuario, no ambos ni ninguno.", ephemeral=True)
+        return
+
+    destino = canal or usuario
+    try:
+        await destino.send(mensaje)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "No pude mandar el mensaje ahí — el bot no tiene permisos, o el usuario tiene los MD cerrados.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(f"Mensaje enviado a {destino.mention}. ✅", ephemeral=True)
+    print(f"{interaction.user} usó /eco hacia {'#' + canal.name if canal else usuario} : {mensaje[:80]}")
+
+
 async def _publicar_payload_crudo(channel_id: int, payload: dict):
     """Publica un mensaje Components V2 llamando directamente a la API REST
     de Discord (en vez de usar client.http.send_message, cuya firma interna
@@ -892,28 +1001,36 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
                 raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
 
 
+COMANDOS_PUBLICAR = {
+    "!publicar-verificacion": ARCHIVO_MENSAJE,
+    "!publicar-guia": ARCHIVO_GUIA,
+}
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    if message.content.strip() != "!publicar-verificacion":
+    comando = message.content.strip()
+    archivo = COMANDOS_PUBLICAR.get(comando)
+    if archivo is None:
         return
     if not message.author.guild_permissions.administrator:
         await message.reply("Solo un administrador puede publicar este mensaje.", delete_after=8)
         return
 
-    with open(ARCHIVO_MENSAJE, encoding="utf-8") as f:
+    with open(archivo, encoding="utf-8") as f:
         payload = json.load(f)
 
     try:
         await _publicar_payload_crudo(message.channel.id, payload)
     except Exception as err:
         await message.reply(f"No pude publicar el mensaje: {err}", delete_after=15)
-        print(f"ERROR al publicar mensaje de verificación: {err}")
+        print(f"ERROR al publicar mensaje ({comando}): {err}")
         return
 
     await message.delete()
-    print(f"Mensaje de verificación publicado en #{message.channel.name}")
+    print(f"Mensaje publicado ({comando}) en #{message.channel.name}")
 
 
 @client.event
