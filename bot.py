@@ -97,6 +97,14 @@ BOT_SHARED_SECRET = os.environ.get("BOT_SHARED_SECRET")
 # sigue funcionando igual mostrando el nombre de Discord (no rompe nada).
 BLOXLINK_API_KEY = os.environ.get("BLOXLINK_API_KEY")
 
+# Canal de Discord donde el bot publica/edita los mensajes de plan de vuelo
+# (Components V2 + nombre real de Roblox vía Bloxlink) — la web le avisa a
+# este bot en vez de mandar un webhook. ID de canal, no de webhook.
+DISCORD_CHANNEL_FLIGHTS = os.environ.get("DISCORD_CHANNEL_FLIGHTS")
+# Mismo patrón para anuncios de posición ATC abierta y para el ATIS.
+DISCORD_CHANNEL_ATC = os.environ.get("DISCORD_CHANNEL_ATC")
+DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS")
+
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
 
@@ -382,6 +390,24 @@ async def _consulta_web(ruta: str, params: dict = None) -> dict:
             return await resp.json()
 
 
+async def _consulta_web_post(ruta: str, body: dict) -> dict:
+    """POST genérico contra la API de la web, autenticado con BOT_SHARED_SECRET.
+    Lanza RuntimeError con el status HTTP incluido en el mensaje (para poder
+    distinguir casos como 409 en el llamador)."""
+    if not BOT_SHARED_SECRET:
+        raise RuntimeError("BOT_SHARED_SECRET no está configurado en el bot")
+    url = f"{WEB_API_BASE}{ruta}"
+    headers = {"x-bot-secret": BOT_SHARED_SECRET, "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status >= 300:
+                detalle = await resp.text()
+                if resp.status == 404:
+                    raise RuntimeError("404: primero tenés que iniciar sesión en la web al menos una vez")
+                raise RuntimeError(f"{resp.status}: {detalle}")
+            return await resp.json()
+
+
 BRANCH_LABEL = {"atc": "🛫 ATC", "pilot": "✈️ Piloto"}
 BRANCH_ORDER = ["atc", "pilot"]
 
@@ -542,6 +568,9 @@ async def iniciar_servidor_web():
     """Levanta el mini servidor HTTP que Render necesita para no apagar el servicio."""
     app = web.Application()
     app.router.add_get("/", _ping)
+    app.router.add_post("/discord/evento-vuelo", _evento_vuelo)
+    app.router.add_post("/discord/evento-atc", _evento_atc)
+    app.router.add_post("/discord/evento-atis", _evento_atis)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -556,20 +585,31 @@ _BOT_START_MS = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1
 
 
 async def _actualizar_presencia_loop():
+    """Rota entre varios estados en vez de mostrar siempre el mismo texto fijo
+    — sigue siendo texto simple (límite real de Discord para bots, ver charla
+    sobre rich presence de usuario), pero se siente más vivo."""
+    indice = 0
     while True:
         try:
             data = await _consulta_web("/api/bot/live-counts")
-            texto = f"{data.get('activeFlights', 0)} vuelos · {data.get('activeControllers', 0)} controladores"
+            vuelos = data.get("activeFlights", 0)
+            controladores = data.get("activeControllers", 0)
+            variantes = [
+                (discord.ActivityType.watching, f"{vuelos} vuelos activos"),
+                (discord.ActivityType.watching, f"{controladores} controladores en línea"),
+                (discord.ActivityType.playing, "ATC24 Español"),
+                (discord.ActivityType.listening, "/academia y /ascender"),
+            ]
+            tipo, texto = variantes[indice % len(variantes)]
+            indice += 1
             # timestamps.start hace que Discord muestre "hace X tiempo" y lo
             # vaya actualizando solo en el cliente de cada usuario — no hace
             # falta que nosotros recalculemos ningún texto de tiempo a mano.
-            actividad = discord.Activity(
-                type=discord.ActivityType.watching, name=texto, timestamps={"start": _BOT_START_MS},
-            )
+            actividad = discord.Activity(type=tipo, name=texto, timestamps={"start": _BOT_START_MS})
             await client.change_presence(activity=actividad)
         except Exception as err:
             print(f"Aviso: no pude actualizar el rich presence: {err}")
-        await asyncio.sleep(120)  # cada 2 minutos — suficiente para que se sienta "en vivo" sin saturar la web
+        await asyncio.sleep(45)  # rota cada 45s entre las 4 variantes (~3 min por vuelta completa)
 
 
 @client.event
@@ -591,8 +631,6 @@ async def setup_hook():
     await iniciar_servidor_web()
 
     client.add_view(BienvenidaView())  # persistente: sobrevive a reinicios del bot
-
-    tree.add_command(academia_group)
 
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
@@ -845,24 +883,13 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
     )
 
 
-academia_group = app_commands.Group(name="academia", description="Comandos de Academia: progreso, certificados y cola de evaluaciones")
-
-
-@academia_group.command(name="progreso", description="Muestra tu progreso en Academia (cursos, evaluaciones, certificados)")
-async def academia_progreso(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        data = await _consulta_web(f"/api/bot/user-progress/{interaction.user.id}")
-    except Exception as err:
-        await interaction.followup.send(f"No pude consultar tu progreso: {err}", ephemeral=True)
-        return
-
+async def _embed_progreso(usuario) -> discord.Embed:
+    data = await _consulta_web(f"/api/bot/user-progress/{usuario.id}")
     embed = discord.Embed(title="📚 Tu progreso en Academia", color=discord.Color.blurple())
 
     if not data.get("enrollments"):
         embed.description = "Todavía no te inscribiste en ninguna rama de Academia. Elige tu rama desde el mensaje que recibiste por mensaje directo al verificarte."
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
+        return embed
 
     cursos_por_rama = _agrupar_por_rama(data.get("courseProgress", []))
     for rama in BRANCH_ORDER:
@@ -888,28 +915,18 @@ async def academia_progreso(interaction: discord.Interaction):
         texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']}" for c in items)
         embed.add_field(name=f"{BRANCH_LABEL[rama]} · Certificados", value=texto, inline=False)
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    return embed
 
 
-@academia_group.command(name="certificado", description="Muestra los certificados de un usuario en Academia")
-@app_commands.describe(miembro="Usuario a consultar (si se deja vacío, se muestra el tuyo)")
-async def academia_certificado(interaction: discord.Interaction, miembro: discord.Member = None):
-    objetivo = miembro or interaction.user
-    await interaction.response.defer()
-    try:
-        data = await _consulta_web(f"/api/bot/certificates/{objetivo.id}")
-    except Exception as err:
-        await interaction.followup.send(f"No pude consultar los certificados: {err}", ephemeral=True)
-        return
-
+async def _embed_certificados(objetivo):
+    """Devuelve (embed, texto_si_vacio) — solo uno de los dos viene con valor."""
+    data = await _consulta_web(f"/api/bot/certificates/{objetivo.id}")
     items = data.get("items", [])
     if not items:
-        await interaction.followup.send(f"{objetivo.mention} todavía no tiene certificados en Academia.")
-        return
+        return None, f"{objetivo.mention} todavía no tiene certificados en Academia."
 
     items = sorted(items, key=lambda c: CERT_TYPE_ORDEN.get(c["type"], 9))
     por_rama = _agrupar_por_rama(items)
-
     embed = discord.Embed(title=f"🎓 Certificados de {objetivo.display_name}", color=discord.Color.gold())
     for rama in BRANCH_ORDER:
         certs = por_rama.get(rama, [])
@@ -917,33 +934,14 @@ async def academia_certificado(interaction: discord.Interaction, miembro: discor
             continue
         texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']} ({c['issuedAt']})" for c in certs)
         embed.add_field(name=BRANCH_LABEL[rama], value=texto, inline=False)
+    return embed, None
 
-    await interaction.followup.send(embed=embed)
 
-
-@academia_group.command(name="cola", description="Muestra las evaluaciones pendientes de revisar")
-@app_commands.describe(rama="Filtrar por rama (dejalo vacío para ver ambas)")
-@app_commands.choices(rama=[
-    app_commands.Choice(name="ATC", value="atc"),
-    app_commands.Choice(name="Piloto", value="pilot"),
-])
-async def academia_cola(interaction: discord.Interaction, rama: app_commands.Choice[str] = None):
-    es_instructor = has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER)
-    if not es_instructor:
-        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    try:
-        data = await _consulta_web("/api/bot/pending-evaluations", {"branch": rama.value} if rama else None)
-    except Exception as err:
-        await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
-        return
-
+async def _embed_cola(rama_valor=None):
+    data = await _consulta_web("/api/bot/pending-evaluations", {"branch": rama_valor} if rama_valor else None)
     items = data.get("items", [])
     if not items:
-        await interaction.followup.send("No hay evaluaciones pendientes ahora mismo. 🎉", ephemeral=True)
-        return
+        return None, "No hay evaluaciones pendientes ahora mismo. 🎉"
 
     por_rama = _agrupar_por_rama(items)
     embed = discord.Embed(title="📋 Evaluaciones pendientes de revisar", color=discord.Color.orange())
@@ -956,7 +954,52 @@ async def academia_cola(interaction: discord.Interaction, rama: app_commands.Cho
             for it in pendientes
         )
         embed.add_field(name=BRANCH_LABEL[r], value=texto, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    return embed, None
+
+
+class AcademiaView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Mi progreso", style=discord.ButtonStyle.primary, emoji="📚")
+    async def progreso_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed = await _embed_progreso(interaction.user)
+        except Exception as err:
+            await interaction.followup.send(f"No pude consultar tu progreso: {err}", ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Mis certificados", style=discord.ButtonStyle.success, emoji="🎓")
+    async def certificados_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed, texto = await _embed_certificados(interaction.user)
+        except Exception as err:
+            await interaction.followup.send(f"No pude consultar tus certificados: {err}", ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, content=texto, ephemeral=True)
+
+    @discord.ui.button(label="Cola de evaluaciones", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def cola_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+            await interaction.response.send_message("Esta opción es solo para Instructores/Liderazgo.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed, texto = await _embed_cola()
+        except Exception as err:
+            await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, content=texto, ephemeral=True)
+
+
+@tree.command(name="academia", description="Progreso, certificados y cola de evaluaciones de Academia")
+async def academia(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Elegí qué querés ver:", view=AcademiaView(), ephemeral=True,
+    )
 
 
 class EcoModal(discord.ui.Modal, title="Mandar mensaje"):
@@ -983,6 +1026,82 @@ class EcoModal(discord.ui.Modal, title="Mandar mensaje"):
             return
         await interaction.response.send_message(f"Mensaje enviado a {self.destino.mention}. ✅", ephemeral=True)
         print(f"{interaction.user} usó /eco hacia {self.destino}")
+
+
+@tree.command(name="vuelo", description="Presenta un plan de vuelo (queda sincronizado con la web, no editable desde Discord)")
+@app_commands.describe(
+    callsign="Callsign", aircraft="Tipo de aeronave", salida="ICAO de salida", llegada="ICAO de llegada",
+    nivel="Nivel de vuelo (ej. FL350)", reglas="Reglas de vuelo",
+    ruta="Ruta (opcional)", alterno="Aeródromo alterno (opcional)", observaciones="Observaciones (opcional)",
+)
+@app_commands.choices(reglas=[
+    app_commands.Choice(name="IFR", value="IFR"),
+    app_commands.Choice(name="VFR", value="VFR"),
+])
+async def vuelo(
+    interaction: discord.Interaction,
+    callsign: str, aircraft: str, salida: str, llegada: str, nivel: str,
+    reglas: app_commands.Choice[str] = None,
+    ruta: str = None, alterno: str = None, observaciones: str = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    body = {
+        "discordId": str(interaction.user.id), "callsign": callsign, "aircraftType": aircraft,
+        "departure": salida.upper(), "destination": llegada.upper(), "level": nivel,
+        "flightRules": reglas.value if reglas else "IFR",
+        "route": ruta or "", "alternate": alterno or "", "remarks": observaciones or "",
+    }
+    try:
+        await _consulta_web_post("/api/bot/flights", body)
+    except Exception as err:
+        await interaction.followup.send(f"No pude presentar el plan de vuelo: {err}", ephemeral=True)
+        return
+    await interaction.followup.send(f"Plan de vuelo **{callsign}** presentado. ✅", ephemeral=True)
+
+
+@tree.command(name="atc", description="Abre una posición ATC (queda sincronizado con la web, no editable desde Discord)")
+@app_commands.describe(aeropuerto="ICAO del aeródromo", posicion="Posición a abrir", frecuencia="Frecuencia (ej. 118.200)")
+@app_commands.choices(posicion=[
+    app_commands.Choice(name="Delivery", value="DEL"),
+    app_commands.Choice(name="Suelo", value="GND"),
+    app_commands.Choice(name="Torre", value="TWR"),
+    app_commands.Choice(name="Aproximación", value="APP"),
+    app_commands.Choice(name="Centro", value="CTR"),
+])
+async def atc(interaction: discord.Interaction, aeropuerto: str, posicion: app_commands.Choice[str], frecuencia: str):
+    if not (has_any_role(interaction.user, ATC_ORDER) or has_any_role(interaction.user, LIDERAZGO_ORDER)):
+        await interaction.response.send_message("Este comando es solo para controladores (rol ATC).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    body = {
+        "discordId": str(interaction.user.id), "airport": aeropuerto.upper(),
+        "positionType": posicion.value, "frequency": frecuencia,
+    }
+    try:
+        data = await _consulta_web_post("/api/bot/atc", body)
+    except Exception as err:
+        mensaje = str(err)
+        if "409" in mensaje:
+            await interaction.followup.send(f"Ya hay alguien controlando {aeropuerto.upper()}_{posicion.value}.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"No pude abrir la posición: {err}", ephemeral=True)
+        return
+    await interaction.followup.send(f"Posición **{aeropuerto.upper()}_{posicion.value}** abierta en {frecuencia}. ✅", ephemeral=True)
+
+
+@tree.command(name="servidor", description="Muestra el estado en vivo de la red: vuelos, controladores y verificados")
+async def servidor(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        data = await _consulta_web("/api/bot/live-counts")
+    except Exception as err:
+        await interaction.followup.send(f"No pude consultar el estado del servidor: {err}")
+        return
+    embed = discord.Embed(title="🌐 Estado de ATC24 Español", color=discord.Color.blurple())
+    embed.add_field(name="Vuelos activos", value=str(data.get("activeFlights", 0)), inline=True)
+    embed.add_field(name="Controladores en línea", value=str(data.get("activeControllers", 0)), inline=True)
+    embed.add_field(name="Verificados", value=f"{data.get('verifiedUsers', 0)} / {data.get('totalUsers', 0)}", inline=True)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="eco", description="Manda un mensaje formal como el bot (a un canal, por MD, o en el mismo canal)")
@@ -1024,6 +1143,237 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
             if resp.status >= 300:
                 detalle = await resp.text()
                 raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+
+
+# ─── Mensajes de plan de vuelo (Components V2, con nombre real de Roblox) ──
+# La web (repo ATC24Espanol) ya no manda estos por webhook — le avisa a este
+# bot vía POST /discord/evento-vuelo (protegido con BOT_SHARED_SECRET), y acá
+# se arma el mensaje con Bloxlink y se crea/edita — 1 solo mensaje por plan,
+# igual que ya hacía la web antes de este cambio.
+_flight_message_ids = {}  # operationUuid -> message_id (en memoria; se pierde si el bot reinicia)
+
+ESTADO_VUELO_LABEL = {
+    "FlightCreated": ("📝 Plan de vuelo presentado", 0x3ddc97),
+    "FlightApproved": ("✅ Vuelo autorizado", 0x3ddc97),
+    "FlightCompleted": ("🏁 Vuelo finalizado", 0x4aa3ff),
+    "FlightWithdrawn": ("↩️ Vuelo retirado", 0xe5484d),
+    "FlightEdited": ("✏️ Plan de vuelo editado", 0xf5a623),
+}
+
+
+def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
+    estado_label, color = ESTADO_VUELO_LABEL.get(tipo, ("Plan de vuelo actualizado", 2872707))
+    lineas = [f"**Discord:** <@{actor_id}>"]
+    if roblox_name:
+        lineas.append(f"**Roblox:** {roblox_name}")
+    lineas.extend([
+        f"**Callsign:** {op.get('callsign') or '—'}",
+        f"**Aircraft:** {op.get('aircraftType') or '—'}",
+        f"**Flight Rules:** {op.get('flightRules') or '—'}",
+        f"**Departing:** {op.get('departure') or '—'}",
+        f"**Arriving:** {op.get('destination') or '—'}",
+        f"**Route:** {op.get('route') or 'OWN NAV'}",
+        f"**Flight Level:** {op.get('level') or '—'}",
+    ])
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17,
+                "accent_color": color,
+                "components": [
+                    {"type": 10, "content": f"# {estado_label}"},
+                    {"type": 14, "divider": True, "spacing": 1},
+                    {"type": 10, "content": "\n".join(lineas)},
+                ],
+            }
+        ],
+    }
+
+
+async def _enviar_o_editar_vuelo(op_uuid: str, payload: dict):
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    mensaje_id = _flight_message_ids.get(op_uuid)
+    async with aiohttp.ClientSession() as session:
+        if mensaje_id:
+            url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages/{mensaje_id}"
+            async with session.patch(url, headers=headers, json=payload) as resp:
+                if resp.status < 300:
+                    return
+                if resp.status != 404:
+                    detalle = await resp.text()
+                    raise RuntimeError(f"Discord respondió {resp.status} al editar: {detalle}")
+                # 404 = lo borraron a mano — cae a crear uno nuevo abajo.
+                _flight_message_ids.pop(op_uuid, None)
+
+        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages"
+        async with session.post(url, headers=headers, json=payload) as resp:
+            if resp.status >= 300:
+                detalle = await resp.text()
+                raise RuntimeError(f"Discord respondió {resp.status} al crear: {detalle}")
+            data = await resp.json()
+            _flight_message_ids[op_uuid] = data["id"]
+
+
+async def _evento_vuelo(request):
+    """Recibe los eventos de plan de vuelo desde la web (ATC24Espanol)."""
+    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    if not DISCORD_CHANNEL_FLIGHTS:
+        return web.json_response({"error": "channel_not_configured"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    tipo = body.get("type")
+    op = body.get("operation") or {}
+    actor = body.get("actor") or {}
+    op_uuid = op.get("uuid")
+    actor_id = actor.get("discordId")
+    if not op_uuid or not actor_id:
+        return web.json_response({"error": "missing_fields"}, status=400)
+
+    try:
+        roblox_name = await _roblox_username(int(actor_id))
+    except Exception:
+        roblox_name = None
+
+    payload = _construir_payload_vuelo(op, actor_id, tipo, roblox_name)
+    try:
+        await _enviar_o_editar_vuelo(op_uuid, payload)
+    except Exception as err:
+        print(f"ERROR al mandar/editar mensaje de vuelo: {err}")
+        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
+    return web.json_response({"ok": True})
+
+
+# ─── Anuncio de posición ATC abierta (Components V2, mención de rol) ──────
+def _construir_payload_atc_abierto(op: dict, actor_id: str):
+    lineas = [
+        f"<@&{V_ROLE_ID}> ¡Nueva posición ATC abierta!",
+        "",
+        f"**Aeropuerto:** {op.get('airport') or '----'}",
+        f"**Posición:** {op.get('positionType') or '---'}",
+        f"**Frecuencia:** {op.get('frequency') or '---.---'}",
+        f"**Controla:** <@{actor_id}>",
+    ]
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": [], "roles": [str(V_ROLE_ID)]},
+        "components": [
+            {"type": 17, "accent_color": 0x3ddc97, "components": [{"type": 10, "content": "\n".join(lineas)}]},
+        ],
+    }
+
+
+async def _evento_atc(request):
+    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    if not DISCORD_CHANNEL_ATC:
+        return web.json_response({"error": "channel_not_configured"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    op = body.get("operation") or {}
+    actor = body.get("actor") or {}
+    actor_id = actor.get("discordId")
+    duracion_min = max(1, body.get("durationMin") or 1)
+    if not actor_id:
+        return web.json_response({"error": "missing_fields"}, status=400)
+
+    payload = _construir_payload_atc_abierto(op, actor_id)
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+                headers=headers, json=payload,
+            ) as resp:
+                if resp.status >= 300:
+                    detalle = await resp.text()
+                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+                data = await resp.json()
+                mensaje_id = data["id"]
+    except Exception as err:
+        print(f"ERROR al mandar anuncio ATC: {err}")
+        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
+
+    async def _autoborrar():
+        await asyncio.sleep(duracion_min * 60)
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.delete(
+                    f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{mensaje_id}",
+                    headers=headers,
+                )
+        except Exception:
+            pass
+
+    asyncio.create_task(_autoborrar())
+    return web.json_response({"ok": True})
+
+
+# ─── ATIS (Components V2, mismo formato ICAO estándar de antes) ───────────
+def _construir_payload_atis(e: dict):
+    ap = (e.get("airport") or "----").upper()
+    ident = e.get("ident") or "A"
+    at_ms = e.get("at")
+    if at_ms:
+        dt = datetime.datetime.fromtimestamp(at_ms / 1000, tz=datetime.timezone.utc)
+        time_str = dt.strftime("%H%MZ")
+    else:
+        time_str = "----Z"
+    dep = e.get("depRwy") or e.get("runway") or "---"
+    arr = e.get("arrRwy") or dep
+    lineas = [
+        f"{ap} ATIS INFO {ident} TIME {time_str}",
+        f"DEP RWY {dep} / ARR RWY {arr}",
+        f"WIND {e.get('wind') or '---/--'} VIS {e.get('visibility') or 'CAVOK'} {e.get('clouds') or 'SKC'}",
+        f"QNH {e.get('qnh') or '----'}",
+        f"TRANSITION LEVEL {e.get('trl') or '----'}",
+    ]
+    if e.get("remarks"):
+        lineas.append(e["remarks"])
+    lineas.append(f"ACKNOWLEDGE RECEIPT OF INFORMATION {ident} ON INITIAL CONTACT")
+    lineas.append(f"END OF INFORMATION {ident}")
+    texto = "```\n" + "\n".join(lineas) + "\n```"
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17, "accent_color": 0xf5a623,
+                "components": [
+                    {"type": 10, "content": f"# 🎙️ ATIS {ap}"},
+                    {"type": 14, "divider": True, "spacing": 1},
+                    {"type": 10, "content": texto},
+                ],
+            },
+        ],
+    }
+
+
+async def _evento_atis(request):
+    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    if not DISCORD_CHANNEL_ATIS:
+        return web.json_response({"error": "channel_not_configured"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    payload = _construir_payload_atis(body)
+    try:
+        await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATIS), payload)
+    except Exception as err:
+        print(f"ERROR al mandar ATIS: {err}")
+        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
+    return web.json_response({"ok": True})
 
 
 COMANDOS_PUBLICAR = {
