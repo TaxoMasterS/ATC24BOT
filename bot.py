@@ -66,6 +66,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 
 import aiohttp
 import discord
@@ -104,6 +105,18 @@ DISCORD_CHANNEL_FLIGHTS = os.environ.get("DISCORD_CHANNEL_FLIGHTS")
 # Mismo patrón para anuncios de posición ATC abierta y para el ATIS.
 DISCORD_CHANNEL_ATC = os.environ.get("DISCORD_CHANNEL_ATC")
 DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS")
+
+# ─── Sistema de tickets de soporte ─────────────────────────────────────────
+# Rol que puede ver/gestionar TODOS los tickets, además de Liderazgo. Opcional
+# — si no está configurado, solo Liderazgo ve los tickets nuevos.
+SOPORTE_ROLE_ID = int(os.environ["SOPORTE_ROLE_ID"]) if os.environ.get("SOPORTE_ROLE_ID") else None
+# Categoría de Discord donde se crean los canales de ticket. Opcional — si no
+# está configurada, el bot busca/crea una categoría llamada "Tickets" sola.
+TICKETS_CATEGORY_ID = int(os.environ["TICKETS_CATEGORY_ID"]) if os.environ.get("TICKETS_CATEGORY_ID") else None
+# Canal donde se registra cada advertencia (/advertir), además de quedar
+# guardada en la web. Opcional — si no está configurado, solo queda el
+# registro en la web y la respuesta ephemeral al moderador.
+DISCORD_CHANNEL_MOD_LOG = os.environ.get("DISCORD_CHANNEL_MOD_LOG")
 
 # Emojis reales del servidor (mismos que ya se usan del lado de la web) —
 # se usan en vez de emojis Unicode genéricos en todos los mensajes.
@@ -392,6 +405,16 @@ def _puede_ascender(invocador: discord.Member, categoria: str) -> bool:
     return False
 
 
+def _puede_ascender_alguna(invocador: discord.Member) -> bool:
+    """True si el invocador puede ascender a alguien en AL MENOS una
+    categoría (Liderazgo, o instructor de alguna rama) — usado para decidir
+    si se muestra el botón "Ascender" dentro de /academia."""
+    if has_any_role(invocador, LIDERAZGO_ORDER):
+        return True
+    ids = {r.id for r in invocador.roles}
+    return any(rid in ids for rid in INSTRUCTOR_ORDER)
+
+
 async def _consulta_web(ruta: str, params: dict = None) -> dict:
     """GET genérico contra la API de la web, autenticado con BOT_SHARED_SECRET.
     Lanza RuntimeError con un mensaje legible si algo sale mal."""
@@ -649,6 +672,8 @@ async def setup_hook():
     await iniciar_servidor_web()
 
     client.add_view(BienvenidaView())  # persistente: sobrevive a reinicios del bot
+    client.add_view(TicketPanelView())  # botón "Abrir ticket" del panel fijo
+    client.add_view(TicketCanalView())  # botón "Cerrar ticket" dentro de cada canal de ticket
 
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
@@ -739,24 +764,21 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         print(f"Error de Discord actualizando a {after}: {err}")
 
 
-@tree.command(name="ascender", description="Otorga un rango a un usuario")
-@app_commands.describe(miembro="Usuario a ascender", rango="Rango a otorgar")
-@app_commands.choices(rango=RANGO_CHOICES)
-async def ascender(interaction: discord.Interaction, miembro: discord.Member, rango: app_commands.Choice[str]):
-    role_id = int(rango.value)
+async def _procesar_ascenso(interaction: discord.Interaction, miembro: discord.Member, role_id: int):
+    """Lógica de ascenso compartida entre el (desactivado) /ascender y el
+    flujo de botón "Ascender" dentro de /academia. Asume que la interacción
+    ya fue diferida (defer) por el llamador antes de invocar esto."""
     categoria = _categoria_de_rol(role_id)
     if categoria is None:
-        await interaction.response.send_message("Rango desconocido.", ephemeral=True)
+        await interaction.followup.send("Rango desconocido.", ephemeral=True)
         return
 
     if not _puede_ascender(interaction.user, categoria):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Liderazgo).",
             ephemeral=True,
         )
         return
-
-    await interaction.response.defer(ephemeral=True)  # la consulta a la web puede tardar más de 3s
 
     if categoria in ("ATC", "PILOTO"):
         branch = "atc" if categoria == "ATC" else "pilot"
@@ -764,7 +786,7 @@ async def ascender(interaction: discord.Interaction, miembro: discord.Member, ra
             certificado = await _certificado_en_rama(str(miembro.id), branch)
         except Exception as err:
             await interaction.followup.send(f"No pude verificar Academia en la web: {err}", ephemeral=True)
-            print(f"ERROR /ascender consultando la web: {err}")
+            print(f"ERROR ascenso consultando la web: {err}")
             return
         if not certificado:
             await interaction.followup.send(
@@ -779,7 +801,7 @@ async def ascender(interaction: discord.Interaction, miembro: discord.Member, ra
         await interaction.followup.send("No encontré ese rol en el servidor — avisa al staff.", ephemeral=True)
         return
     try:
-        await miembro.add_roles(rol, reason=f"Ascenso otorgado por {interaction.user} (/ascender)")
+        await miembro.add_roles(rol, reason=f"Ascenso otorgado por {interaction.user} (vía /academia)")
     except discord.Forbidden:
         await interaction.followup.send(
             "No pude asignar el rol — la jerarquía de roles del bot es insuficiente.",
@@ -793,6 +815,29 @@ async def ascender(interaction: discord.Interaction, miembro: discord.Member, ra
         f"Listo — {miembro.mention} ahora tiene **{PREFIX_LABELS.get(role_id, rol.name)}**.",
         ephemeral=True,
     )
+
+
+# Desactivado como comando de nivel superior a pedido del usuario — el mismo
+# flujo ahora vive dentro de /academia (botón "Ascender", visible solo para
+# quien puede ascender a alguien). Se deja comentado, no borrado, por si se
+# quiere reactivar como comando independiente más adelante.
+# @tree.command(name="ascender", description="Otorga un rango a un usuario")
+# @app_commands.describe(miembro="Usuario a ascender", rango="Rango a otorgar")
+# @app_commands.choices(rango=RANGO_CHOICES)
+# async def ascender(interaction: discord.Interaction, miembro: discord.Member, rango: app_commands.Choice[str]):
+#     role_id = int(rango.value)
+#     categoria = _categoria_de_rol(role_id)
+#     if categoria is None:
+#         await interaction.response.send_message("Rango desconocido.", ephemeral=True)
+#         return
+#     if not _puede_ascender(interaction.user, categoria):
+#         await interaction.response.send_message(
+#             "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Liderazgo).",
+#             ephemeral=True,
+#         )
+#         return
+#     await interaction.response.defer(ephemeral=True)
+#     await _procesar_ascenso(interaction, miembro, role_id)
 
 
 @tree.command(name="apodo", description="Actualiza tu propio apodo según tus roles actuales")
@@ -846,7 +891,10 @@ async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Membe
         await interaction.response.send_message(f"El apodo de {miembro.mention} ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@tree.command(name="apodo-todos", description="Recalcula el apodo de todos los miembros")
+# Desactivado a pedido del usuario (por ahora) — decorador comentado para que
+# no se registre como slash command. La función queda intacta para reactivar
+# solo con descomentar la línea de abajo.
+# @tree.command(name="apodo-todos", description="Recalcula el apodo de todos los miembros")
 async def apodo_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -873,7 +921,10 @@ async def apodo_todos(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="apodo-borrartodos", description="Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
+# Desactivado a pedido del usuario (por ahora) — decorador comentado para que
+# no se registre como slash command. La función queda intacta para reactivar
+# solo con descomentar la línea de abajo.
+# @tree.command(name="apodo-borrartodos", description="Borra el apodo de TODOS los miembros (vuelven a su nombre de usuario)")
 async def apodo_borrar_todos(interaction: discord.Interaction):
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("Este comando es solo para el dueño del servidor.", ephemeral=True)
@@ -976,9 +1027,45 @@ async def _embed_cola(rama_valor=None):
     return embed, None
 
 
-class AcademiaView(discord.ui.View):
+class AscenderRangoSelect(discord.ui.Select):
+    def __init__(self, miembro: discord.Member):
+        self.miembro = miembro
+        opciones = [
+            discord.SelectOption(label=PREFIX_LABELS[rid], value=str(rid))
+            for rid in (LIDERAZGO_ORDER + INSTRUCTOR_ORDER + ATC_ORDER + PILOTO_ORDER + GC_ORDER)
+        ]
+        super().__init__(placeholder=f"Rango a otorgar a {miembro.display_name}", min_values=1, max_values=1, options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)  # la consulta a Academia puede tardar más de 3s
+        await _procesar_ascenso(interaction, self.miembro, int(self.values[0]))
+
+
+class AscenderMiembroSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Elige el usuario a ascender", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        miembro = self.values[0]
+        if not isinstance(miembro, discord.Member):
+            await interaction.response.send_message("No pude resolver ese usuario en este servidor.", ephemeral=True)
+            return
+        vista = discord.ui.View(timeout=180)
+        vista.add_item(AscenderRangoSelect(miembro))
+        await interaction.response.send_message(f"Elige el rango a otorgar a {miembro.mention}:", view=vista, ephemeral=True)
+
+
+class AscenderInicioView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
+        self.add_item(AscenderMiembroSelect())
+
+
+class AcademiaView(discord.ui.View):
+    def __init__(self, invocador: discord.Member):
+        super().__init__(timeout=180)
+        if not _puede_ascender_alguna(invocador):
+            self.remove_item(self.ascender_btn)
 
     @discord.ui.button(label="Mi progreso", style=discord.ButtonStyle.primary, emoji="📚")
     async def progreso_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1013,11 +1100,20 @@ class AcademiaView(discord.ui.View):
             return
         await interaction.followup.send(embed=embed, content=texto, ephemeral=True)
 
+    @discord.ui.button(label="Ascender", style=discord.ButtonStyle.danger)
+    async def ascender_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # No hace falta re-chequear permiso acá: si el botón está visible es
+        # porque _puede_ascender_alguna ya dio true en __init__, y el permiso
+        # exacto por categoría se vuelve a validar en _procesar_ascenso.
+        await interaction.response.send_message(
+            "Elige al usuario a ascender:", view=AscenderInicioView(), ephemeral=True,
+        )
 
-@tree.command(name="academia", description="Progreso, certificados y cola de evaluaciones de Academia")
+
+@tree.command(name="academia", description="Progreso, certificados, cola de evaluaciones y ascensos de Academia")
 async def academia(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "Elige qué quieres ver:", view=AcademiaView(), ephemeral=True,
+        "Elige qué quieres ver:", view=AcademiaView(interaction.user), ephemeral=True,
     )
 
 
@@ -1121,6 +1217,247 @@ async def servidor(interaction: discord.Interaction):
     embed.add_field(name="Controladores en línea", value=str(data.get("activeControllers", 0)), inline=True)
     embed.add_field(name="Verificados", value=f"{data.get('verifiedUsers', 0)} / {data.get('totalUsers', 0)}", inline=True)
     await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="advertir", description="Da una advertencia formal a un usuario (queda registrada en la web)")
+@app_commands.describe(miembro="Usuario a advertir", motivo="Motivo de la advertencia")
+async def advertir(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
+    if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await _consulta_web_post("/api/bot/warnings", {
+            "discordId": str(miembro.id),
+            "moderatorId": str(interaction.user.id),
+            "moderatorName": str(interaction.user),
+            "reason": motivo,
+        })
+    except Exception as err:
+        await interaction.followup.send(f"No pude registrar la advertencia: {err}", ephemeral=True)
+        return
+
+    total = data.get("total", "?")
+    await interaction.followup.send(
+        f"{E['cruz']} Advertencia registrada para {miembro.mention}. Ahora tiene **{total}** advertencia(s).",
+        ephemeral=True,
+    )
+
+    try:
+        await miembro.send(
+            "Recibiste una advertencia en **ATC24 Español**.\n"
+            f"**Motivo:** {motivo}\n"
+            "Si crees que fue un error, contacta a Liderazgo."
+        )
+    except discord.Forbidden:
+        pass  # MD cerrados — no rompe el flujo, la advertencia ya quedó registrada
+
+    if DISCORD_CHANNEL_MOD_LOG:
+        canal_log = client.get_channel(int(DISCORD_CHANNEL_MOD_LOG))
+        if canal_log:
+            embed_log = discord.Embed(title=f"{E['cruz']} Nueva advertencia", color=discord.Color.orange())
+            embed_log.add_field(name="Usuario", value=miembro.mention, inline=True)
+            embed_log.add_field(name="Por", value=interaction.user.mention, inline=True)
+            embed_log.add_field(name="Total acumulado", value=str(total), inline=True)
+            embed_log.add_field(name="Motivo", value=motivo, inline=False)
+            await canal_log.send(embed=embed_log)
+
+
+@tree.command(name="advertencia", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Liderazgo")
+@app_commands.describe(usuario="Usuario a consultar (déjalo vacío para ver las tuyas)")
+async def advertencia(interaction: discord.Interaction, usuario: discord.Member = None):
+    objetivo = usuario or interaction.user
+    if usuario and usuario.id != interaction.user.id and not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+        await interaction.response.send_message("Solo Instructores/Liderazgo pueden ver las advertencias de otra persona.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await _consulta_web(f"/api/bot/warnings/{objetivo.id}")
+    except Exception as err:
+        await interaction.followup.send(f"No pude consultar las advertencias: {err}", ephemeral=True)
+        return
+
+    items = data.get("items", [])
+    if not items:
+        await interaction.followup.send(f"{objetivo.mention} no tiene advertencias registradas.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"Advertencias de {objetivo.display_name}", color=discord.Color.orange())
+    for w in items[:10]:
+        fecha = datetime.datetime.fromtimestamp(w["at"] / 1000, tz=datetime.timezone.utc).strftime("%d/%m/%Y")
+        quien = w.get("moderatorName") or w.get("moderatorId") or "—"
+        embed.add_field(name=f"{fecha} — por {quien}", value=w.get("reason") or "—", inline=False)
+    if len(items) > 10:
+        embed.set_footer(text=f"Mostrando las 10 más recientes de {len(items)} en total.")
+    else:
+        embed.set_footer(text=f"Total: {len(items)}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Sistema de tickets de soporte — canal privado por ticket, creado a demanda
+# desde /reportar o desde el botón del panel fijo (/panel-soporte). Solo lo
+# ve quien lo abrió y el staff (SOPORTE_ROLE_ID, o Liderazgo si no hay rol
+# configurado). El seguimiento de "quién tiene un ticket abierto" vive en
+# memoria — sobrevive mientras el bot está corriendo, se resetea al
+# reiniciar (peor caso: alguien puede abrir un segundo ticket si reinició
+# justo en el medio, no rompe nada).
+TICKET_PANEL_CUSTOM_ID = "atc24:ticket:abrir"
+TICKET_CERRAR_CUSTOM_ID = "atc24:ticket:cerrar"
+
+_tickets_abiertos = {}  # discord_id -> channel_id
+
+
+def _ticket_autor(channel_id: int):
+    for uid, cid in _tickets_abiertos.items():
+        if cid == channel_id:
+            return uid
+    return None
+
+
+def _slug_canal(nombre: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", nombre.lower()).strip("-")
+    return (s or "usuario")[:80]
+
+
+async def _categoria_tickets(guild: discord.Guild):
+    if TICKETS_CATEGORY_ID:
+        cat = guild.get_channel(TICKETS_CATEGORY_ID)
+        if isinstance(cat, discord.CategoryChannel):
+            return cat
+    for c in guild.categories:
+        if c.name.lower() == "tickets":
+            return c
+    try:
+        return await guild.create_category("Tickets", reason="Categoría automática para tickets de soporte")
+    except discord.Forbidden:
+        return None
+
+
+async def _crear_ticket(interaction: discord.Interaction, motivo: str, descripcion: str):
+    guild = interaction.guild or (client.get_guild(int(GUILD_ID)) if GUILD_ID else None)
+    if guild is None:
+        await interaction.response.send_message("No pude ubicar el servidor — avisa al staff.", ephemeral=True)
+        return
+
+    existente_id = _tickets_abiertos.get(interaction.user.id)
+    if existente_id:
+        canal_existente = guild.get_channel(existente_id)
+        if canal_existente:
+            await interaction.response.send_message(f"Ya tienes un ticket abierto: {canal_existente.mention}", ephemeral=True)
+            return
+        _tickets_abiertos.pop(interaction.user.id, None)  # el canal ya no existe — se limpia el registro viejo
+
+    await interaction.response.defer(ephemeral=True)
+
+    categoria = await _categoria_tickets(guild)
+    rol_soporte = guild.get_role(SOPORTE_ROLE_ID) if SOPORTE_ROLE_ID else None
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+    }
+    if rol_soporte:
+        overwrites[rol_soporte] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    else:
+        for rid in LIDERAZGO_ORDER:
+            rol = guild.get_role(rid)
+            if rol:
+                overwrites[rol] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    nombre_canal = f"ticket-{_slug_canal(interaction.user.display_name)}"
+    try:
+        canal = await guild.create_text_channel(
+            nombre_canal, category=categoria, overwrites=overwrites,
+            reason=f"Ticket de soporte abierto por {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "No pude crear el canal del ticket — al bot le falta el permiso \"Gestionar canales\".",
+            ephemeral=True,
+        )
+        return
+
+    _tickets_abiertos[interaction.user.id] = canal.id
+
+    embed = discord.Embed(title=f"{E['chat']} Ticket de soporte", description=descripcion, color=discord.Color.blurple())
+    embed.add_field(name="Abierto por", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Motivo", value=motivo, inline=True)
+    embed.set_footer(text="ATC24 Español")
+
+    mencion_staff = rol_soporte.mention if rol_soporte else " ".join(f"<@&{rid}>" for rid in LIDERAZGO_ORDER[:1])
+    await canal.send(content=f"{interaction.user.mention} {mencion_staff}", embed=embed, view=TicketCanalView())
+    await interaction.followup.send(f"Listo, tu ticket quedó en {canal.mention}.", ephemeral=True)
+
+
+class TicketModal(discord.ui.Modal, title="Abrir ticket de soporte"):
+    motivo = discord.ui.TextInput(label="Motivo (breve)", max_length=100, required=True)
+    descripcion = discord.ui.TextInput(
+        label="Descripción",
+        style=discord.TextStyle.paragraph,
+        placeholder="Contanos qué pasó, con el mayor detalle posible…",
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _crear_ticket(interaction, str(self.motivo), str(self.descripcion))
+
+
+class TicketCanalView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistente
+
+    @discord.ui.button(label="Cerrar ticket", style=discord.ButtonStyle.danger, custom_id=TICKET_CERRAR_CUSTOM_ID)
+    async def cerrar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        autor_id = _ticket_autor(interaction.channel.id)
+        es_staff = has_any_role(interaction.user, LIDERAZGO_ORDER) or (SOPORTE_ROLE_ID and has_any_role(interaction.user, [SOPORTE_ROLE_ID]))
+        if not es_staff and interaction.user.id != autor_id:
+            await interaction.response.send_message("Solo el autor del ticket o el staff pueden cerrarlo.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(f"Cerrando este ticket en 5 segundos — lo cierra {interaction.user.mention}.")
+        if autor_id is not None:
+            _tickets_abiertos.pop(autor_id, None)
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket cerrado por {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send("No pude borrar el canal — al bot le falta el permiso \"Gestionar canales\".")
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistente
+
+    @discord.ui.button(label="Abrir ticket", style=discord.ButtonStyle.primary, custom_id=TICKET_PANEL_CUSTOM_ID)
+    async def abrir_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal())
+
+
+@tree.command(name="panel-soporte", description="Publica en este canal el panel fijo para abrir tickets de soporte")
+async def panel_soporte(interaction: discord.Interaction):
+    if not has_any_role(interaction.user, LIDERAZGO_ORDER):
+        await interaction.response.send_message("Este comando es solo para Liderazgo.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="Soporte ATC24 Español",
+        description=(
+            f"{E['chat']} ¿Tienes un problema, una duda o quieres reportar algo?\n"
+            "Presiona el botón para abrir un ticket privado — solo tú y el staff lo van a poder ver."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.channel.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message("Panel de soporte publicado en este canal.", ephemeral=True)
+
+
+@tree.command(name="reportar", description="Abre un ticket privado de soporte para reportar algo")
+async def reportar(interaction: discord.Interaction):
+    await interaction.response.send_modal(TicketModal())
 
 
 @tree.command(name="eco", description="Manda un mensaje formal como el bot (a un canal, por MD, o en el mismo canal)")
