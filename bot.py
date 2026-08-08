@@ -105,6 +105,23 @@ DISCORD_CHANNEL_FLIGHTS = os.environ.get("DISCORD_CHANNEL_FLIGHTS")
 DISCORD_CHANNEL_ATC = os.environ.get("DISCORD_CHANNEL_ATC")
 DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS")
 
+# Emojis reales del servidor (mismos que ya se usan del lado de la web) —
+# se usan en vez de emojis Unicode genéricos en todos los mensajes.
+E = {
+    "avion": "<:Avion:1534071045865341019>",
+    "check": "<:Check:1534080132526903369>",
+    "cruz": "<:Cruz:1534080002864451736>",
+    "flecha": "<:flecha:1534071380625195048>",
+    "brujula": "<:brujula:1534077767958663329>",
+    "antena": "<:Antena:1534070807792324659>",
+    "atc": "<:ATC:1534071009060061214>",
+    "reloj": "<:reloj:1534077832245018664>",
+    "chat": "<:chat:1534077571279360141>",
+    "libro": "<:libro:1534075380405764227>",
+    "microfono": "<:microfono:1534077647494316137>",
+    "verificado": "<:Verificado:1534081412536205422>",
+}
+
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
 
@@ -403,7 +420,7 @@ async def _consulta_web_post(ruta: str, body: dict) -> dict:
             if resp.status >= 300:
                 detalle = await resp.text()
                 if resp.status == 404:
-                    raise RuntimeError("404: primero tenés que iniciar sesión en la web al menos una vez")
+                    raise RuntimeError("404: primero tienes que iniciar sesión en la web al menos una vez")
                 raise RuntimeError(f"{resp.status}: {detalle}")
             return await resp.json()
 
@@ -412,19 +429,19 @@ BRANCH_LABEL = {"atc": "🛫 ATC", "pilot": "✈️ Piloto"}
 BRANCH_ORDER = ["atc", "pilot"]
 
 COURSE_STATE_LABEL = {
-    "locked": "🔒 Bloqueado",
-    "in_progress": "📘 En progreso",
-    "theory_done": "📗 Teoría completada",
-    "completed": "✅ Completado",
+    "locked": f"{E['cruz']} Bloqueado",
+    "in_progress": f"{E['libro']} En progreso",
+    "theory_done": f"{E['libro']} Teoría completada",
+    "completed": f"{E['check']} Completado",
 }
 EVAL_STATE_LABEL = {
     "locked": "Evaluación bloqueada",
     "available": "Evaluación disponible",
-    "pending": "⏳ Evaluación en revisión",
-    "approved": "✅ Evaluación aprobada",
-    "rejected": "❌ Evaluación rechazada",
+    "pending": f"{E['reloj']} Evaluación en revisión",
+    "approved": f"{E['check']} Evaluación aprobada",
+    "rejected": f"{E['cruz']} Evaluación rechazada",
 }
-CERT_TYPE_LABEL = {"final": "🏅 Certificado final", "theory": "📄 Certificado de teoría"}
+CERT_TYPE_LABEL = {"final": f"{E['verificado']} Certificado final", "theory": f"{E['libro']} Certificado de teoría"}
 CERT_TYPE_ORDEN = {"final": 0, "theory": 1}
 
 
@@ -571,6 +588,7 @@ async def iniciar_servidor_web():
     app.router.add_post("/discord/evento-vuelo", _evento_vuelo)
     app.router.add_post("/discord/evento-atc", _evento_atc)
     app.router.add_post("/discord/evento-atis", _evento_atis)
+    app.router.add_post("/discord/tabla-atc", _evento_tabla_atc)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -885,11 +903,12 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
 
 async def _embed_progreso(usuario) -> discord.Embed:
     data = await _consulta_web(f"/api/bot/user-progress/{usuario.id}")
-    embed = discord.Embed(title="📚 Tu progreso en Academia", color=discord.Color.blurple())
+    embed = discord.Embed(title="Tu progreso en Academia", color=discord.Color.blurple())
 
     if not data.get("enrollments"):
-        embed.description = "Todavía no te inscribiste en ninguna rama de Academia. Elige tu rama desde el mensaje que recibiste por mensaje directo al verificarte."
+        embed.description = f"{E['libro']} Todavía no te inscribiste en ninguna rama de Academia. Elige tu rama desde el mensaje que recibiste por mensaje directo al verificarte."
         return embed
+    embed.description = E["libro"]
 
     cursos_por_rama = _agrupar_por_rama(data.get("courseProgress", []))
     for rama in BRANCH_ORDER:
@@ -927,7 +946,7 @@ async def _embed_certificados(objetivo):
 
     items = sorted(items, key=lambda c: CERT_TYPE_ORDEN.get(c["type"], 9))
     por_rama = _agrupar_por_rama(items)
-    embed = discord.Embed(title=f"🎓 Certificados de {objetivo.display_name}", color=discord.Color.gold())
+    embed = discord.Embed(title=f"Certificados de {objetivo.display_name}", description=E["verificado"], color=discord.Color.gold())
     for rama in BRANCH_ORDER:
         certs = por_rama.get(rama, [])
         if not certs:
@@ -941,10 +960,10 @@ async def _embed_cola(rama_valor=None):
     data = await _consulta_web("/api/bot/pending-evaluations", {"branch": rama_valor} if rama_valor else None)
     items = data.get("items", [])
     if not items:
-        return None, "No hay evaluaciones pendientes ahora mismo. 🎉"
+        return None, f"{E['check']} No hay evaluaciones pendientes ahora mismo."
 
     por_rama = _agrupar_por_rama(items)
-    embed = discord.Embed(title="📋 Evaluaciones pendientes de revisar", color=discord.Color.orange())
+    embed = discord.Embed(title="Evaluaciones pendientes de revisar", description=E["chat"], color=discord.Color.orange())
     for r in BRANCH_ORDER:
         pendientes = por_rama.get(r, [])
         if not pendientes:
@@ -998,7 +1017,7 @@ class AcademiaView(discord.ui.View):
 @tree.command(name="academia", description="Progreso, certificados y cola de evaluaciones de Academia")
 async def academia(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "Elegí qué querés ver:", view=AcademiaView(), ephemeral=True,
+        "Elige qué quieres ver:", view=AcademiaView(), ephemeral=True,
     )
 
 
@@ -1097,7 +1116,7 @@ async def servidor(interaction: discord.Interaction):
     except Exception as err:
         await interaction.followup.send(f"No pude consultar el estado del servidor: {err}")
         return
-    embed = discord.Embed(title="🌐 Estado de ATC24 Español", color=discord.Color.blurple())
+    embed = discord.Embed(title="Estado de ATC24 Español", description=E["antena"], color=discord.Color.blurple())
     embed.add_field(name="Vuelos activos", value=str(data.get("activeFlights", 0)), inline=True)
     embed.add_field(name="Controladores en línea", value=str(data.get("activeControllers", 0)), inline=True)
     embed.add_field(name="Verificados", value=f"{data.get('verifiedUsers', 0)} / {data.get('totalUsers', 0)}", inline=True)
@@ -1153,11 +1172,10 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
 _flight_message_ids = {}  # operationUuid -> message_id (en memoria; se pierde si el bot reinicia)
 
 ESTADO_VUELO_LABEL = {
-    "FlightCreated": ("📝 Plan de vuelo presentado", 0x3ddc97),
-    "FlightApproved": ("✅ Vuelo autorizado", 0x3ddc97),
-    "FlightCompleted": ("🏁 Vuelo finalizado", 0x4aa3ff),
-    "FlightWithdrawn": ("↩️ Vuelo retirado", 0xe5484d),
-    "FlightEdited": ("✏️ Plan de vuelo editado", 0xf5a623),
+    "FlightApproved": (f"{E['check']} Vuelo autorizado", 0x3ddc97),
+    "FlightCompleted": (f"{E['brujula']} Vuelo finalizado", 0x4aa3ff),
+    "FlightWithdrawn": (f"{E['cruz']} Vuelo retirado", 0xe5484d),
+    "FlightEdited": (f"{E['flecha']} Plan de vuelo editado", 0xf5a623),
 }
 
 
@@ -1252,7 +1270,7 @@ async def _evento_vuelo(request):
 # ─── Anuncio de posición ATC abierta (Components V2, mención de rol) ──────
 def _construir_payload_atc_abierto(op: dict, actor_id: str):
     lineas = [
-        f"<@&{V_ROLE_ID}> ¡Nueva posición ATC abierta!",
+        f"{E['antena']} <@&{V_ROLE_ID}> Nueva posición ATC abierta.",
         "",
         f"**Aeropuerto:** {op.get('airport') or '----'}",
         f"**Posición:** {op.get('positionType') or '---'}",
@@ -1317,6 +1335,85 @@ async def _evento_atc(request):
     return web.json_response({"ok": True})
 
 
+# ─── Tabla "ATC Online" — un único mensaje, siempre el último del canal ───
+# La web ya no la arma por webhook: le manda la lista de posiciones activas
+# a este endpoint cada vez que alguien abre o cierra una posición, y el bot
+# borra el mensaje anterior (si existe) y publica uno nuevo — así queda
+# garantizado que hay un solo mensaje y que siempre es el más reciente.
+_tabla_atc_message_id = None
+
+
+def _construir_payload_tabla_atc(activos: list):
+    if not activos:
+        lineas = [f"{E['antena']} No hay ninguna posición ATC abierta ahora mismo."]
+    else:
+        por_aeropuerto = {}
+        for op in activos:
+            ap = op.get("airport") or "----"
+            por_aeropuerto.setdefault(ap, []).append(op)
+        lineas = [f"{E['antena']} {len(activos)} posición(es) abierta(s) ahora mismo", ""]
+        for ap in sorted(por_aeropuerto):
+            lineas.append(f"**{ap}**")
+            for op in por_aeropuerto[ap]:
+                pos = op.get("positionType") or "---"
+                owner = op.get("ownerId")
+                quien = f"<@{owner}>" if owner else (op.get("controllerName") or "—")
+                freq = op.get("frequency") or "---.---"
+                lineas.append(f"`{ap}_{pos}` — {quien} ({freq})")
+            lineas.append("")
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17, "accent_color": 0x3ddc97,
+                "components": [
+                    {"type": 10, "content": "# Controladores en línea"},
+                    {"type": 14, "divider": True, "spacing": 1},
+                    {"type": 10, "content": "\n".join(lineas).strip()},
+                ],
+            },
+        ],
+    }
+
+
+async def _evento_tabla_atc(request):
+    global _tabla_atc_message_id
+    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    if not DISCORD_CHANNEL_ATC:
+        return web.json_response({"error": "channel_not_configured"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    payload = _construir_payload_tabla_atc(body.get("activeAtc") or [])
+
+    async with aiohttp.ClientSession() as session:
+        if _tabla_atc_message_id:
+            await session.delete(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{_tabla_atc_message_id}",
+                headers=headers,
+            )
+        try:
+            async with session.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+                headers=headers, json=payload,
+            ) as resp:
+                if resp.status >= 300:
+                    detalle = await resp.text()
+                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+                data = await resp.json()
+                _tabla_atc_message_id = data["id"]
+        except Exception as err:
+            print(f"ERROR al actualizar la tabla de ATC Online: {err}")
+            return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
+
+    return web.json_response({"ok": True})
+
+
 # ─── ATIS (Components V2, mismo formato ICAO estándar de antes) ───────────
 def _construir_payload_atis(e: dict):
     ap = (e.get("airport") or "----").upper()
@@ -1348,7 +1445,7 @@ def _construir_payload_atis(e: dict):
             {
                 "type": 17, "accent_color": 0xf5a623,
                 "components": [
-                    {"type": 10, "content": f"# 🎙️ ATIS {ap}"},
+                    {"type": 10, "content": f"# {E['microfono']} ATIS {ap}"},
                     {"type": 14, "divider": True, "spacing": 1},
                     {"type": 10, "content": texto},
                 ],
