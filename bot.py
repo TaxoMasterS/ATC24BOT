@@ -625,21 +625,35 @@ _presencia_iniciada = False  # evita arrancar el loop dos veces si on_ready se d
 _BOT_START_MS = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
 
 
+def _plural(n, singular, plural):
+    """'1 vuelo activo' en vez de '1 vuelos activos' — detalle chico pero se nota."""
+    return f"{n} {singular if n == 1 else plural}"
+
+
 async def _actualizar_presencia_loop():
     """Rota entre varios estados en vez de mostrar siempre el mismo texto fijo
     — sigue siendo texto simple (límite real de Discord para bots, ver charla
-    sobre rich presence de usuario), pero se siente más vivo."""
+    sobre rich presence de usuario), pero se siente más vivo. Usa los mismos
+    datos que ya devuelve /api/bot/live-counts (totalUsers/verifiedUsers
+    estaban disponibles pero no se usaban) para variar el contenido, no solo
+    el tipo de actividad."""
     indice = 0
     while True:
         try:
             data = await _consulta_web("/api/bot/live-counts")
             vuelos = data.get("activeFlights", 0)
             controladores = data.get("activeControllers", 0)
+            verificados = data.get("verifiedUsers", 0)
+
             variantes = [
-                (discord.ActivityType.watching, f"{vuelos} vuelos activos"),
-                (discord.ActivityType.watching, f"{controladores} controladores en línea"),
-                (discord.ActivityType.playing, "ATC24 Español"),
+                (discord.ActivityType.watching,
+                    _plural(vuelos, "vuelo activo", "vuelos activos") if vuelos else "el radar en silencio"),
+                (discord.ActivityType.watching,
+                    _plural(controladores, "controlador en línea", "controladores en línea") if controladores else "el espacio aéreo sin control"),
+                (discord.ActivityType.competing, "ATC24 Español"),
                 (discord.ActivityType.listening, "/academia y /ascender"),
+                (discord.ActivityType.watching, _plural(verificados, "piloto o controlador verificado", "pilotos y controladores verificados")),
+                (discord.ActivityType.playing, "Volando contigo de la mano"),
             ]
             tipo, texto = variantes[indice % len(variantes)]
             indice += 1
@@ -650,7 +664,7 @@ async def _actualizar_presencia_loop():
             await client.change_presence(activity=actividad)
         except Exception as err:
             print(f"Aviso: no pude actualizar el rich presence: {err}")
-        await asyncio.sleep(45)  # rota cada 45s entre las 4 variantes (~3 min por vuelta completa)
+        await asyncio.sleep(40)  # rota cada 40s entre las 6 variantes (~4 min por vuelta completa)
 
 
 @client.event
@@ -1509,6 +1523,11 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
 _flight_message_ids = {}  # operationUuid -> message_id (en memoria; se pierde si el bot reinicia)
 
 ESTADO_VUELO_LABEL = {
+    # Antes FlightCreated no tenía entrada acá — la web lo mandaba aparte por
+    # un webhook con un mensaje suelto sin relación con este (ver
+    # discordNotifier.js). Ahora es el primer estado de este mismo mensaje,
+    # que después se va editando en el lugar (autorizado → finalizado/etc.).
+    "FlightCreated": (f"{E['avion']} Nuevo plan de vuelo", 0x3ddc97),
     "FlightApproved": (f"{E['check']} Vuelo autorizado", 0x3ddc97),
     "FlightCompleted": (f"{E['brujula']} Vuelo finalizado", 0x4aa3ff),
     "FlightWithdrawn": (f"{E['cruz']} Vuelo retirado", 0xe5484d),
@@ -1518,18 +1537,29 @@ ESTADO_VUELO_LABEL = {
 
 def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
     estado_label, color = ESTADO_VUELO_LABEL.get(tipo, ("Plan de vuelo actualizado", 2872707))
-    lineas = [f"**Discord:** <@{actor_id}>"]
+    lineas = [f"{E['antena']} **Discord:** <@{actor_id}>"]
     if roblox_name:
-        lineas.append(f"**Roblox:** {roblox_name}")
+        lineas.append(f"{E['antena']} **Roblox:** {roblox_name}")
     lineas.extend([
-        f"**Callsign:** {op.get('callsign') or '—'}",
-        f"**Aircraft:** {op.get('aircraftType') or '—'}",
-        f"**Flight Rules:** {op.get('flightRules') or '—'}",
-        f"**Departing:** {op.get('departure') or '—'}",
-        f"**Arriving:** {op.get('destination') or '—'}",
-        f"**Route:** {op.get('route') or 'OWN NAV'}",
-        f"**Flight Level:** {op.get('level') or '—'}",
+        f"{E['avion']} **Callsign:** {op.get('callsign') or '—'}",
+        f"{E['avion']} **Aircraft:** {op.get('aircraftType') or '—'}",
+        f"{E['libro']} **Flight Rules:** {op.get('flightRules') or '—'}",
+        f"{E['flecha']} **Departing:** {op.get('departure') or '—'}",
+        f"{E['brujula']} **Arriving:** {op.get('destination') or '—'}",
+        f"{E['flecha']} **Route:** {op.get('route') or 'OWN NAV'}",
+        f"{E['flecha']} **Flight Level:** {op.get('level') or '—'}",
     ])
+    # Campos opcionales — sólo aparecen si el plan realmente los tiene
+    # cargados (squawk/pista los asigna control al autorizar, no siempre
+    # están en el momento de crear el plan).
+    opcionales = [
+        ("Squawk", op.get("squawk")),
+        ("Runway", op.get("runway")),
+        ("Alternate", op.get("alternate")),
+    ]
+    for etiqueta, valor in opcionales:
+        if valor:
+            lineas.append(f"{E['atc']} **{etiqueta}:** {valor}")
     return {
         "flags": 32768,
         "allowed_mentions": {"parse": []},
