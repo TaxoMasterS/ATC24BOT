@@ -46,6 +46,12 @@ publica el mensaje ahí y borra tu comando. Después de publicarlo una
 vez, no hace falta volver a escribirlo — el bot debe seguir
 corriendo 24/7 para poder reaccionar a los clics futuros.
 
+Mismo mecanismo para el resto de los mensajes fijos — un !comando por
+cada archivo en payloads/ (ver COMANDOS_PUBLICAR más abajo):
+
+    !publicar-guia               guía general de la web y el bot
+    !publicar-guia-bloxlink      guía de verificación con Bloxlink
+
 HOSTING EN RENDER (GRATIS, SIN TARJETA)
 -----------------------------------------
 Este script además levanta un mini servidor web (puerto tomado de la
@@ -148,6 +154,7 @@ CUSTOM_ID_PILOTO = "atc24_bienvenida_piloto"
 CUSTOM_ID_ATC = "atc24_bienvenida_atc"
 ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "payloads", "verificacion.json")
 ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "payloads", "guia.json")
+ARCHIVO_GUIA_BLOXLINK = os.path.join(CARPETA_SCRIPT, "payloads", "guia_bloxlink.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
 # Cada lista va del rango MÁS ALTO al más bajo dentro de su categoría.
@@ -1853,6 +1860,7 @@ async def _evento_atis(request):
 COMANDOS_PUBLICAR = {
     "!publicar-verificacion": ARCHIVO_MENSAJE,
     "!publicar-guia": ARCHIVO_GUIA,
+    "!publicar-guia-bloxlink": ARCHIVO_GUIA_BLOXLINK,
 }
 
 

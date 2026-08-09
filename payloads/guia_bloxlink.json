@@ -1,0 +1,82 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 2872707,
+      "components": [
+        {
+          "type": 10,
+          "content": "# <:Verificado:1534081412536205422> GUÍA — VERIFICACIÓN CON BLOXLINK"
+        },
+        {
+          "type": 10,
+          "content": "Bloxlink vincula tu cuenta de **Roblox** con tu cuenta de **Discord** — así el servidor sabe quién sos de verdad y te puede dar tus roles correctamente. Hace falta antes de poder verificarte en ATC24 Español."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 2
+        },
+        {
+          "type": 10,
+          "content": "## <:Check:1534080132526903369> Verificación automática (la más rápida)\n\nApretá el botón de abajo, iniciá sesión con tu cuenta de **Roblox** y Bloxlink hace el resto solo. Cuando termine, volvé a este servidor y escribí **/verify** una vez para que se apliquen tus roles acá."
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 5,
+              "label": "Verificarme con Bloxlink",
+              "url": "https://blox.link/verify",
+              "emoji": {
+                "id": "1534071045865341019",
+                "name": "Avion"
+              }
+            }
+          ]
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:reloj:1534077832245018664> Ya usé Bloxlink antes (en otro servidor)\n\nLa vinculación es de tu **cuenta**, no de un servidor puntual — si ya verificaste tu Roblox con Bloxlink en algún otro lado, no hace falta repetir todo de nuevo:\n\n1. Escribí **/verify** en cualquier canal del servidor.\n2. Bloxlink va a reconocer tu cuenta y te confirma al toque.\n\nSi no te reconoce (por ejemplo, cambiaste de cuenta de Roblox), usá **/update** para que Bloxlink vuelva a revisar tu vinculación."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:libro:1534075380405764227> Primera vez usando Bloxlink\n\nSi nunca lo usaste, seguí estos pasos:\n\n1. Escribí **/verify** en cualquier canal del servidor.\n2. Bloxlink te va a mostrar un enlace para iniciar sesión con tu cuenta de **Roblox** (es el mismo destino que el botón de arriba).\n3. Iniciá sesión y confirmá que sos vos — según el método que te ofrezca Bloxlink, puede ser un inicio de sesión directo o pegar un código corto en la descripción de tu perfil de Roblox por un momento.\n4. Volvé a Discord y escribí **/verify** de nuevo — Bloxlink confirma la vinculación y ya queda lista para siempre."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## <:chat:1534077571279360141> Comandos útiles de Bloxlink\n\n**/verify** — vincula o confirma tu cuenta de Roblox\n**/update** — fuerza que Bloxlink revise tu vinculación de nuevo\n**/bloxlink** — muestra tu vinculación actual"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "-# ¿No te funciona ninguna de estas opciones? Abrí un ticket con **/reportar** y te ayuda Staff."
+        }
+      ]
+    }
+  ]
+}
