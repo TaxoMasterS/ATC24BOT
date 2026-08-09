@@ -689,14 +689,24 @@ async def setup_hook():
     client.add_view(TicketPanelView())  # botón "Abrir ticket" del panel fijo
     client.add_view(TicketCanalView())  # botón "Cerrar ticket" dentro de cada canal de ticket
 
-    if GUILD_ID:
-        guild_obj = discord.Object(id=int(GUILD_ID))
-        tree.copy_global_to(guild=guild_obj)
-        await tree.sync(guild=guild_obj)
-        print(f"Slash commands sincronizados al servidor {GUILD_ID} (instantáneo).")
-    else:
-        await tree.sync()
-        print("Slash commands sincronizados globalmente (puede tardar ~1h en propagarse).")
+    # Antes esto no tenía try/except: si Discord (o Cloudflare delante de
+    # Discord, bajo tráfico/rate-limit) respondía con un error transitorio acá,
+    # el bot se caía ENTERO al arrancar — y como Render lo reinicia solo, eso
+    # arma un crash-loop que se auto-alimenta (cada reintento de sync hace más
+    # probable el próximo bloqueo). Un fallo de sync no debe tumbar el bot: los
+    # comandos ya registrados de una sincronización previa siguen funcionando
+    # igual, sólo no se actualizan hasta el próximo arranque exitoso.
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
+            print(f"Slash commands sincronizados al servidor {GUILD_ID} (instantáneo).")
+        else:
+            await tree.sync()
+            print("Slash commands sincronizados globalmente (puede tardar ~1h en propagarse).")
+    except Exception as err:
+        print(f"Aviso: no pude sincronizar los slash commands al arrancar (sigo con los que ya estaban registrados): {err}")
 
 
 @client.event
