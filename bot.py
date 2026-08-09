@@ -72,6 +72,7 @@ import asyncio
 import datetime
 import json
 import os
+import random
 import re
 
 import aiohttp
@@ -82,6 +83,17 @@ from aiohttp import web
 from welcome_card import generar_tarjeta_bienvenida
 
 CARPETA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
+
+# En Render las variables de entorno ya están puestas en el dashboard, pero
+# para correr el bot en una PC local no hay dashboard — esto carga el
+# archivo .env (si existe, junto a este script) antes de leer nada con
+# os.environ, sin que haga falta exportar cada variable a mano en la
+# terminal. No hace nada si no encuentra un .env (ej. en Render).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(CARPETA_SCRIPT, ".env"))
+except ImportError:
+    pass
 
 # ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -1864,11 +1876,156 @@ COMANDOS_PUBLICAR = {
 }
 
 
+# ─── Autorización de plan de vuelo (comando oculto, sin slash — a propósito
+# no aparece en ningún listado de comandos ni en las guías) ────────────────
+# "!autorizar" arma la captura del canal: el PRÓXIMO mensaje que llegue ahí
+# se interpreta como el plan de vuelo a autorizar y se desarma solo (no
+# queda escuchando todo lo que se hable en el canal). Prioriza el plan REAL
+# ya presentado en la web (si el autor tiene uno activo); si no hay, intenta
+# interpretar el propio texto del mensaje. El resultado se manda por MD al
+# piloto, nunca al canal — no queda rastro público de que esto existe.
+AUTORIZAR_ARMADO: set[int] = set()  # IDs de canal armados en este momento
+
+_RE_ICAO = re.compile(r"\b([A-Z]{4})\b")
+_RE_CALLSIGN = re.compile(r"\b([A-Z]{2,4}\d{1,4}[A-Z]?)\b")
+_RE_NIVEL = re.compile(r"\bFL ?(\d{2,3})\b", re.IGNORECASE)
+
+
+def _puede_autorizar(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return ATC_ROLE_ID in {r.id for r in member.roles}
+
+
+def _parsear_plan_de_texto(texto: str):
+    """Interpretación libre de un plan pegado a mano — sin formato fijo,
+    busca lo mínimo indispensable (reglas de vuelo + dos aeródromos ICAO).
+    Sin eso no hay forma responsable de armar una autorización."""
+    mayus = texto.upper()
+    if "IFR" in mayus:
+        reglas = "IFR"
+    elif "VFR" in mayus:
+        reglas = "VFR"
+    else:
+        return None
+
+    aerodromos = _RE_ICAO.findall(mayus)
+    if len(aerodromos) < 2:
+        return None
+
+    m_callsign = _RE_CALLSIGN.search(mayus)
+    m_nivel = _RE_NIVEL.search(mayus)
+    return {
+        "callsign": m_callsign.group(1) if m_callsign else "AERONAVE",
+        "flightRules": reglas,
+        "departure": aerodromos[0],
+        "destination": aerodromos[1],
+        "route": "",
+        "level": m_nivel.group(1) and f"FL{m_nivel.group(1)}" or "",
+        "squawk": "",
+    }
+
+
+def _squawk_de(plan: dict) -> str:
+    squawk = (plan.get("squawk") or "").strip()
+    if squawk:
+        return squawk
+    # Código transponder de relleno (1000-7777, primer dígito 1-7 como en la
+    # vida real) — solo para tener algo que leer; control real lo confirma.
+    return "".join(str(random.randint(0 if i else 1, 7)) for i in range(4))
+
+
+def _construir_autorizacion(plan: dict, fuente: str) -> str:
+    callsign = plan.get("callsign") or "AERONAVE"
+    reglas = (plan.get("flightRules") or "IFR").upper()
+    salida = plan.get("departure") or "----"
+    destino = plan.get("destination") or "----"
+    ruta = (plan.get("route") or "").strip()
+    nivel = (plan.get("level") or "").strip()
+    squawk = _squawk_de(plan)
+
+    if reglas == "VFR":
+        lineas = [
+            f"**{callsign}**, vuelo VFR {salida} → {destino} aprobado.",
+            "Manténgase fuera de espacio aéreo controlado salvo autorización expresa.",
+            f"Squawk **{squawk}**.",
+        ]
+        if nivel:
+            lineas.append(f"Nivel sugerido {nivel}, sujeto a condiciones VMC.")
+    else:
+        via = f" vía {ruta}" if ruta else ""
+        lineas = [f"**{callsign}**, autorizado a {destino}{via}."]
+        if nivel:
+            lineas.append(f"Ascienda y mantenga {nivel}.")
+        lineas.append(f"Squawk **{squawk}**.")
+
+    origen = "tu plan de vuelo activo en la web" if fuente == "web" else "tu último mensaje en el canal"
+    lineas.append("")
+    lineas.append(f"-# Generado a partir de {origen} — confirmá los datos con control antes de rodar.")
+    return "\n".join(lineas)
+
+
+async def _procesar_autorizacion(message: discord.Message):
+    autor = message.author
+    plan, fuente = None, None
+
+    try:
+        data = await _consulta_web(f"/api/bot/latest-flight/{autor.id}")
+        if data.get("flight"):
+            plan, fuente = data["flight"], "web"
+    except Exception as err:
+        print(f"Aviso: no pude consultar el plan real en la web para autorizar: {err}")
+
+    if plan is None:
+        plan = _parsear_plan_de_texto(message.content)
+        fuente = "mensaje"
+
+    try:
+        if plan is None:
+            await autor.send(
+                "No pude armar una autorización — no tenés un plan de vuelo activo en la web, "
+                "y tu último mensaje tampoco tenía los datos mínimos (indicativo, salida, destino "
+                "y si es IFR o VFR)."
+            )
+        else:
+            await autor.send(_construir_autorizacion(plan, fuente))
+    except discord.Forbidden:
+        print(f"Aviso: no pude mandarle la autorización por MD a {autor} (tiene los MD cerrados).")
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     comando = message.content.strip()
+
+    # "!autorizar" — comando oculto que arma/desarma la captura del próximo
+    # mensaje de este canal. Se borra a sí mismo siempre, haya funcionado o
+    # no, para no dejar rastro de que existe.
+    if comando.lower() == "!autorizar":
+        await message.delete()
+        if not isinstance(message.author, discord.Member) or not _puede_autorizar(message.author):
+            return
+        canal_id = message.channel.id
+        armado = canal_id not in AUTORIZAR_ARMADO
+        if armado:
+            AUTORIZAR_ARMADO.add(canal_id)
+        else:
+            AUTORIZAR_ARMADO.discard(canal_id)
+        try:
+            await message.author.send(
+                f"Autorización {'armada' if armado else 'desarmada'} en #{message.channel.name}"
+                + (" — el próximo mensaje ahí se interpreta como el plan a autorizar." if armado else ".")
+            )
+        except discord.Forbidden:
+            pass
+        return
+
+    if message.channel.id in AUTORIZAR_ARMADO:
+        AUTORIZAR_ARMADO.discard(message.channel.id)
+        await _procesar_autorizacion(message)
+        return
+
     archivo = COMANDOS_PUBLICAR.get(comando)
     if archivo is None:
         return
