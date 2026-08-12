@@ -2531,6 +2531,43 @@ async def on_message(message: discord.Message):
 
     comando = message.content.strip()
 
+    # "!help" — lista pública de comandos, agrupada por a quién le sirve
+    # cada uno. A diferencia de "!autorizar" y demás, este es un comando
+    # normal: no se borra a sí mismo ni requiere permisos.
+    if comando.lower() == "!help":
+        embed = discord.Embed(title="Comandos de ATC24 Español", color=BRAND_SKY_NAVY)
+        embed.add_field(
+            name="Para todos",
+            value=(
+                "**/academia** — progreso, certificados y cola de evaluaciones\n"
+                "**/apodo** — recalcula tu propio apodo\n"
+                "**/vuelo** — presenta un plan de vuelo\n"
+                "**/atc** — abre una posición de control\n"
+                "**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n"
+                "**/advertencia** — consulta tus advertencias registradas\n"
+                "**/reportar** — abre un ticket privado de soporte"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Para Instructores / Staff",
+            value=(
+                "**/apodo-miembro** — actualiza el apodo de otro miembro\n"
+                "**/advertir** — registra una advertencia formal a un usuario\n"
+                "**/panel-soporte** — publica el panel fijo de tickets en un canal\n"
+                "**/eco** — envía un mensaje formal en nombre del bot"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Exclusivo para ATC",
+            value="**/panel-atc** — encuesta de interés en control, cierre forzado de posición, anuncios rápidos",
+            inline=False,
+        )
+        embed.set_footer(text="Los ascensos se otorgan desde el botón Ascender dentro de /academia.")
+        await message.channel.send(embed=embed)
+        return
+
     # "!autorizar" — comando oculto que arma/desarma la captura del próximo
     # mensaje de este canal. Se borra a sí mismo siempre, haya funcionado o
     # no, para no dejar rastro de que existe.
