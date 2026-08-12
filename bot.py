@@ -2564,6 +2564,15 @@ async def on_message(message: discord.Message):
             value="**/panel-atc** — encuesta de interés en control, cierre forzado de posición, anuncios rápidos",
             inline=False,
         )
+        embed.add_field(
+            name="Administrador (texto, no aparecen en el selector \"/\")",
+            value=(
+                "**!publicar-verificacion** — publica el botón de verificación en este canal\n"
+                "**!publicar-guia** — publica la guía de uso de la web y el bot\n"
+                "**!publicar-guia-bloxlink** — publica la guía de verificación con Bloxlink"
+            ),
+            inline=False,
+        )
         embed.set_footer(text="Los ascensos se otorgan desde el botón Ascender dentro de /academia.")
         await message.channel.send(embed=embed)
         return
