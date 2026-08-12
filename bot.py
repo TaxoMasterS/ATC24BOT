@@ -1450,9 +1450,9 @@ async def advertir(interaction: discord.Interaction, miembro: discord.Member, mo
             await canal_log.send(embed=embed_log)
 
 
-@tree.command(name="advertencia", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Staff")
+@tree.command(name="advertencias", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Staff")
 @app_commands.describe(usuario="Usuario a consultar (déjalo vacío para ver las tuyas)")
-async def advertencia(interaction: discord.Interaction, usuario: discord.Member = None):
+async def advertencias(interaction: discord.Interaction, usuario: discord.Member = None):
     objetivo = usuario or interaction.user
     if usuario and usuario.id != interaction.user.id and not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
         await interaction.response.send_message("Solo Instructores/Staff pueden ver las advertencias de otra persona.", ephemeral=True)
@@ -2096,13 +2096,14 @@ async def _procesar_solicitud_control(interaction: discord.Interaction):
             }
         ],
     }
-    for canal_id in {DISCORD_CHANNEL_ATC, CANAL_SOLICITUD_CONTROL_EXTRA}:
-        if not canal_id:
-            continue
+    # Solo al canal dedicado a esto — el de "Anuncios ATC" (DISCORD_CHANNEL_ATC)
+    # queda reservado para la tabla de controladores en línea y los anuncios
+    # de posición abierta, sin mezclarlo con las solicitudes.
+    if CANAL_SOLICITUD_CONTROL_EXTRA:
         try:
-            await _publicar_payload_crudo(int(canal_id), payload)
+            await _publicar_payload_crudo(int(CANAL_SOLICITUD_CONTROL_EXTRA), payload)
         except Exception as err:
-            print(f"ERROR al notificar solicitud de control en el canal {canal_id}: {err}")
+            print(f"ERROR al notificar solicitud de control en el canal {CANAL_SOLICITUD_CONTROL_EXTRA}: {err}")
 
 
 # ─── Panel de ATC — comando /panel-atc, solo visible/usable para ATCs ─────
@@ -2544,7 +2545,7 @@ async def on_message(message: discord.Message):
                 "**/vuelo** — presenta un plan de vuelo\n"
                 "**/atc** — abre una posición de control\n"
                 "**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n"
-                "**/advertencia** — consulta tus advertencias registradas\n"
+                "**/advertencias** — consulta tus advertencias registradas\n"
                 "**/reportar** — abre un ticket privado de soporte"
             ),
             inline=False,
