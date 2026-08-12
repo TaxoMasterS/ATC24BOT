@@ -14,7 +14,7 @@
         },
         {
           "type": 10,
-          "content": "Bloxlink vincula tu cuenta de **Roblox** con tu cuenta de **Discord** — así el servidor puede confirmar quién sos de verdad y asignarte tus roles y tu apodo correctamente, usando tu nombre real de Roblox en vez de tu nombre de usuario de Discord. Es un paso obligatorio dentro del proceso de verificación de ATC24 Español."
+          "content": "Bloxlink vincula tu cuenta de **Roblox** con tu cuenta de **Discord** — así el servidor puede confirmar quién eres de verdad y asignarte tus roles y tu apodo correctamente, usando tu nombre real de Roblox en vez de tu nombre de usuario de Discord. Es un paso obligatorio dentro del proceso de verificación de ATC24 Español."
         },
         {
           "type": 14,
@@ -23,7 +23,7 @@
         },
         {
           "type": 10,
-          "content": "## <:Check:1534080132526903369> Verificación automática (la más rápida)\n\n1. Presioná el botón de abajo.\n2. Iniciá sesión con tu cuenta de **Roblox** cuando Bloxlink te lo pida.\n3. Confirmá la vinculación — Bloxlink hace el resto solo.\n4. Volvé a este servidor y escribí **/verify** una vez, para que tus roles y tu apodo se actualicen acá."
+          "content": "## <:Check:1534080132526903369> Verificación automática (la más rápida)\n\n1. Presiona el botón de abajo.\n2. Inicia sesión con tu cuenta de **Roblox** cuando Bloxlink te lo pida.\n3. Confirma la vinculación — Bloxlink hace el resto solo.\n4. Vuelve a este servidor y escribe **/verify** una vez, para que tus roles y tu apodo se actualicen aquí."
         },
         {
           "type": 1,
@@ -47,7 +47,7 @@
         },
         {
           "type": 10,
-          "content": "## <:reloj:1534077832245018664> Ya usé Bloxlink antes (en otro servidor)\n\nLa vinculación es de tu **cuenta de Discord**, no de un servidor puntual — si ya verificaste tu Roblox con Bloxlink en algún otro servidor, no hace falta repetir todo el proceso:\n\n1. Escribí **/verify** en cualquier canal de este servidor.\n2. Bloxlink va a reconocer tu cuenta ya vinculada y confirmarla al instante.\n\nSi no te reconoce (por ejemplo, cambiaste de cuenta de Roblox, o cambiaste tu nombre de usuario), usá **/update** para forzar que Bloxlink vuelva a revisar tu vinculación desde cero."
+          "content": "## <:reloj:1534077832245018664> Ya usé Bloxlink antes (en otro servidor)\n\nLa vinculación es de tu **cuenta de Discord**, no de un servidor puntual — si ya verificaste tu Roblox con Bloxlink en algún otro servidor, no hace falta repetir todo el proceso:\n\n1. Escribe **/verify** en cualquier canal de este servidor.\n2. Bloxlink va a reconocer tu cuenta ya vinculada y confirmarla al instante.\n\nSi no te reconoce (por ejemplo, cambiaste de cuenta de Roblox, o cambiaste tu nombre de usuario), usa **/update** para forzar que Bloxlink vuelva a revisar tu vinculación desde cero."
         },
         {
           "type": 14,
@@ -56,7 +56,7 @@
         },
         {
           "type": 10,
-          "content": "## <:libro:1534075380405764227> Primera vez usando Bloxlink\n\nSi nunca usaste Bloxlink, seguí estos pasos con calma:\n\n1. Escribí **/verify** en cualquier canal del servidor.\n2. Bloxlink te va a mostrar un enlace para iniciar sesión con tu cuenta de **Roblox** (es el mismo destino que el botón de arriba).\n3. Iniciá sesión y confirmá que sos vos. Según el método que te ofrezca Bloxlink en ese momento, puede pedirte un inicio de sesión directo, o pegar un código corto en la descripción de tu perfil de Roblox durante unos minutos (solo para confirmar que la cuenta es tuya — podés borrarlo después).\n4. Volvé a Discord y escribí **/verify** de nuevo. Bloxlink confirma la vinculación y queda guardada para siempre — no hace falta repetir esto en el futuro."
+          "content": "## <:libro:1534075380405764227> Primera vez usando Bloxlink\n\nSi nunca usaste Bloxlink, sigue estos pasos con calma:\n\n1. Escribe **/verify** en cualquier canal del servidor.\n2. Bloxlink te va a mostrar un enlace para iniciar sesión con tu cuenta de **Roblox** (es el mismo destino que el botón de arriba).\n3. Inicia sesión y confirma que eres tú. Según el método que te ofrezca Bloxlink en ese momento, puede pedirte un inicio de sesión directo, o pegar un código corto en la descripción de tu perfil de Roblox durante unos minutos (solo para confirmar que la cuenta es tuya — puedes borrarlo después).\n4. Vuelve a Discord y escribe **/verify** de nuevo. Bloxlink confirma la vinculación y queda guardada para siempre — no hace falta repetir esto en el futuro."
         },
         {
           "type": 14,
@@ -65,7 +65,7 @@
         },
         {
           "type": 10,
-          "content": "## <:ATC:1534071009060061214> Problemas comunes\n\n**\"/verify\" no me reconoce ninguna cuenta.**\nProbablemente todavía no completaste la vinculación desde el botón de arriba. Hacela primero, y después volvé a escribir **/verify**.\n\n**Mi apodo no cambió después de verificarme.**\nDale un par de minutos — a veces tarda en propagarse. Si sigue igual, usá **/apodo** para forzar el recálculo manualmente.\n\n**Bloxlink dice que ya estoy vinculado, pero con la cuenta de Roblox equivocada.**\nUsá **/update** para que Bloxlink vuelva a pedirte que confirmes tu cuenta actual — así se reemplaza la vinculación vieja por la correcta.\n\n**El código que pegué en mi perfil de Roblox no lo detecta.**\nRevisá que lo hayas guardado bien en la sección de descripción/\"About\" de tu perfil de Roblox (no en otro lado), y que hayan pasado al menos un par de minutos antes de reintentar — Roblox también tarda un poco en actualizar tu perfil público."
+          "content": "## <:ATC:1534071009060061214> Problemas comunes\n\n**\"/verify\" no me reconoce ninguna cuenta.**\nProbablemente todavía no completaste la vinculación desde el botón de arriba. Hazla primero, y después vuelve a escribir **/verify**.\n\n**Mi apodo no cambió después de verificarme.**\nDale un par de minutos — a veces tarda en propagarse. Si sigue igual, usa **/apodo** para forzar el recálculo manualmente.\n\n**Bloxlink dice que ya estoy vinculado, pero con la cuenta de Roblox equivocada.**\nUsa **/update** para que Bloxlink vuelva a pedirte que confirmes tu cuenta actual — así se reemplaza la vinculación vieja por la correcta.\n\n**El código que pegué en mi perfil de Roblox no lo detecta.**\nRevisa que lo hayas guardado bien en la sección de descripción/\"About\" de tu perfil de Roblox (no en otro lado), y que hayan pasado al menos un par de minutos antes de reintentar — Roblox también tarda un poco en actualizar tu perfil público."
         },
         {
           "type": 14,
@@ -83,7 +83,7 @@
         },
         {
           "type": 10,
-          "content": "-# ¿No te funciona ninguna de estas opciones? Abrí un ticket con **/reportar** y te ayuda Staff."
+          "content": "-# ¿No te funciona ninguna de estas opciones? Abre un ticket con **/reportar** y te ayuda Staff."
         }
       ]
     }

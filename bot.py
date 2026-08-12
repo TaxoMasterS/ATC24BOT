@@ -1607,7 +1607,7 @@ class TicketModal(discord.ui.Modal, title="Abrir ticket de soporte"):
     descripcion = discord.ui.TextInput(
         label="Descripción",
         style=discord.TextStyle.paragraph,
-        placeholder="Contanos qué pasó, con el mayor detalle posible…",
+        placeholder="Cuéntanos qué pasó, con el mayor detalle posible…",
         max_length=1000,
         required=True,
     )
@@ -1656,7 +1656,7 @@ async def panel_soporte(interaction: discord.Interaction):
         title="Soporte ATC24 Español",
         description=(
             f"{E['chat']} ¿Tienes un problema, una duda o algo para reportar? Presiona el botón de abajo "
-            "y se va a crear un canal privado — solo lo van a poder ver vos y el staff.\n\n"
+            "y se va a crear un canal privado — solo lo van a poder ver tú y el staff.\n\n"
             "**Algunos motivos comunes para abrir un ticket:**\n"
             "• Reportar un error o mal funcionamiento del bot o de la web.\n"
             "• Pedir ayuda con la verificación de Bloxlink.\n"
@@ -1664,7 +1664,7 @@ async def panel_soporte(interaction: discord.Interaction):
             "• Reportar a otro usuario por una falta de conducta.\n"
             "• Cualquier duda sobre Academia, evaluaciones o ascensos.\n"
             "• Cualquier otra situación que prefieras tratar en privado con el staff.\n\n"
-            "Contanos con el mayor detalle posible qué pasó — así el staff puede ayudarte más rápido."
+            "Cuéntanos con el mayor detalle posible qué pasó — así el staff puede ayudarte más rápido."
         ),
         color=BRAND_SKY_NAVY,
     )
@@ -1691,7 +1691,7 @@ async def eco(
         await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
         return
     if canal and usuario:
-        await interaction.response.send_message("Elegí solo uno: un canal O un usuario, no ambos.", ephemeral=True)
+        await interaction.response.send_message("Elige solo uno: un canal O un usuario, no ambos.", ephemeral=True)
         return
 
     # Si no se especifica nada, se manda en el mismo canal donde se ejecutó el comando.
@@ -1724,6 +1724,21 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
 # se arma el mensaje con Bloxlink y se crea/edita — 1 solo mensaje por plan,
 # igual que ya hacía la web antes de este cambio.
 _flight_message_ids = {}  # operationUuid -> message_id (en memoria; se pierde si el bot reinicia)
+# Un lock POR VUELO (no uno global — no hace falta serializar vuelos
+# distintos entre sí). Sin esto: si dos eventos del MISMO vuelo llegan casi
+# juntos (típico cuando se aprueba automáticamente al no haber torre/ATC —
+# "creado" y "autorizado" casi al mismo tiempo), los dos pueden leer
+# _flight_message_ids ANTES de que ninguno lo escriba, y terminan creando
+# DOS mensajes separados en vez de uno solo editado.
+_flight_message_locks: dict = {}
+
+
+def _lock_para_vuelo(op_uuid: str) -> asyncio.Lock:
+    lock = _flight_message_locks.get(op_uuid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _flight_message_locks[op_uuid] = lock
+    return lock
 
 ESTADO_VUELO_LABEL = {
     # Antes FlightCreated no tenía entrada acá — la web lo mandaba aparte por
@@ -1781,27 +1796,28 @@ def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
 
 
 async def _enviar_o_editar_vuelo(op_uuid: str, payload: dict):
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-    mensaje_id = _flight_message_ids.get(op_uuid)
-    async with aiohttp.ClientSession() as session:
-        if mensaje_id:
-            url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages/{mensaje_id}"
-            async with session.patch(url, headers=headers, json=payload) as resp:
-                if resp.status < 300:
-                    return
-                if resp.status != 404:
-                    detalle = await resp.text()
-                    raise RuntimeError(f"Discord respondió {resp.status} al editar: {detalle}")
-                # 404 = lo borraron a mano — cae a crear uno nuevo abajo.
-                _flight_message_ids.pop(op_uuid, None)
+    async with _lock_para_vuelo(op_uuid):
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+        mensaje_id = _flight_message_ids.get(op_uuid)
+        async with aiohttp.ClientSession() as session:
+            if mensaje_id:
+                url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages/{mensaje_id}"
+                async with session.patch(url, headers=headers, json=payload) as resp:
+                    if resp.status < 300:
+                        return
+                    if resp.status != 404:
+                        detalle = await resp.text()
+                        raise RuntimeError(f"Discord respondió {resp.status} al editar: {detalle}")
+                    # 404 = lo borraron a mano — cae a crear uno nuevo abajo.
+                    _flight_message_ids.pop(op_uuid, None)
 
-        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages"
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status >= 300:
-                detalle = await resp.text()
-                raise RuntimeError(f"Discord respondió {resp.status} al crear: {detalle}")
-            data = await resp.json()
-            _flight_message_ids[op_uuid] = data["id"]
+            url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages"
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status >= 300:
+                    detalle = await resp.text()
+                    raise RuntimeError(f"Discord respondió {resp.status} al crear: {detalle}")
+                data = await resp.json()
+                _flight_message_ids[op_uuid] = data["id"]
 
 
 async def _evento_vuelo(request):
@@ -2054,7 +2070,7 @@ async def _procesar_solicitud_control(interaction: discord.Interaction):
     if anterior and ahora - anterior < SOLICITUD_CONTROL_COOLDOWN:
         restante = int(SOLICITUD_CONTROL_COOLDOWN - (ahora - anterior))
         await interaction.response.send_message(
-            f"Ya solicitaste la apertura de una posición hace poco. Podés volver a hacerlo en {restante} segundos.",
+            f"Ya solicitaste la apertura de una posición hace poco. Puedes volver a hacerlo en {restante} segundos.",
             ephemeral=True,
         )
         return
@@ -2200,7 +2216,7 @@ class CerrarPosicionSelect(discord.ui.Select):
             await interaction.response.send_message(f"No pude actualizar la tabla: {err}", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"Posición `{clave}` cerrada en la tabla de Discord. Esto solo corrige lo que se ve acá — "
+            f"Posición `{clave}` cerrada en la tabla de Discord. Esto solo corrige lo que se ve aquí — "
             "no cierra la posición del lado de la web.",
             ephemeral=True,
         )
@@ -2235,7 +2251,7 @@ class PanelATCView(discord.ui.View):
             await interaction.response.send_message("No hay ninguna posición registrada para cerrar ahora mismo.", ephemeral=True)
             return
         await interaction.response.send_message(
-            "Elegí la posición a cerrar:", view=CerrarPosicionView(), ephemeral=True,
+            "Elige la posición a cerrar:", view=CerrarPosicionView(), ephemeral=True,
         )
 
     @discord.ui.button(label="Anuncio rápido a ATC", style=discord.ButtonStyle.secondary)
@@ -2426,7 +2442,7 @@ async def _procesar_autorizacion(message: discord.Message):
     try:
         if plan is None:
             await autor.send(
-                "No pude armar una autorización — no tenés un plan de vuelo activo en la web, "
+                "No pude armar una autorización — no tienes un plan de vuelo activo en la web, "
                 "y tu último mensaje tampoco tenía los datos mínimos (indicativo, salida, destino "
                 "y si es IFR o VFR)."
             )
@@ -2455,7 +2471,7 @@ async def _procesar_mensaje_conteo(message: discord.Message):
 
     if numero != esperado or mismo_usuario:
         if mismo_usuario and numero == esperado:
-            motivo = "no podés contar dos veces seguidas"
+            motivo = "no puedes contar dos veces seguidas"
         else:
             motivo = f"seguía el **{esperado}**"
         try:

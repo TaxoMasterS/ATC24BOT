@@ -14,7 +14,7 @@
         },
         {
           "type": 10,
-          "content": "Esta guía explica, paso a paso, todo el recorrido: desde que te unís al servidor hasta que ya estás operando activamente como Piloto o Controlador. Guardala — te va a servir de referencia más de una vez."
+          "content": "Esta guía explica, paso a paso, todo el recorrido: desde que te unes al servidor hasta que ya estás operando activamente como Piloto o Controlador. Guárdala — te va a servir de referencia más de una vez."
         },
         {
           "type": 14,
@@ -23,11 +23,11 @@
         },
         {
           "type": 10,
-          "content": "## <:Check:1534080132526903369> 1. Verificación\n\nAl unirte se te asigna el rol **NV | No Verificado**, que solo te da acceso a los canales básicos del servidor.\n\n1. Buscá el mensaje de verificación fijo del canal correspondiente.\n2. Presioná **\"Acepto y confirmo\"** — con eso aceptás las reglas del servidor.\n3. Se te retira **NV** y se te otorga **V | Verificado**, dándote acceso al resto del servidor.\n4. Inmediatamente te llega un mensaje directo del bot para elegir tu rama."
+          "content": "## <:Check:1534080132526903369> 1. Verificación\n\nAl unirte se te asigna el rol **NV | No Verificado**, que solo te da acceso a los canales básicos del servidor.\n\n1. Busca el mensaje de verificación fijo del canal correspondiente.\n2. Presiona **\"Acepto y confirmo\"** — con eso aceptas las reglas del servidor.\n3. Se te retira **NV** y se te otorga **V | Verificado**, dándote acceso al resto del servidor.\n4. Inmediatamente te llega un mensaje directo del bot para elegir tu rama."
         },
         {
           "type": 10,
-          "content": "Este botón solo confirma que aceptaste las reglas — es independiente de la verificación de tu cuenta de Roblox con Bloxlink, que se hace aparte (ver la guía específica con **!publicar-guia-bloxlink**, o preguntale a Staff si no la tenés a mano)."
+          "content": "Este botón solo confirma que aceptaste las reglas — es independiente de la verificación de tu cuenta de Roblox con Bloxlink, que se hace aparte (ver la guía específica con **!publicar-guia-bloxlink**, o pregúntale a Staff si no la tienes a mano)."
         },
         {
           "type": 14,
@@ -36,7 +36,7 @@
         },
         {
           "type": 10,
-          "content": "## <:Avion:1534071045865341019> 2. Elegí tu rama\n\nEn el mensaje directo que te llega tras verificarte, elegí una de las dos ramas:\n\n• **Piloto** — volás aeronaves, presentás planes de vuelo y avanzás por los rangos de piloto.\n• **Controlador de Tráfico Aéreo (ATC)** — gestionás posiciones de control, das autorizaciones y avanzás por los rangos de controlador.\n\nElegir una rama todavía no te da ningún rango — solo te manda el enlace correcto para inscribirte en Academia. Podés confirmarlo en cualquier momento con **/academia**."
+          "content": "## <:Avion:1534071045865341019> 2. Elige tu rama\n\nEn el mensaje directo que te llega tras verificarte, elige una de las dos ramas:\n\n• **Piloto** — vuelas aeronaves, presentas planes de vuelo y avanzas por los rangos de piloto.\n• **Controlador de Tráfico Aéreo (ATC)** — gestionas posiciones de control, das autorizaciones y avanzas por los rangos de controlador.\n\nElegir una rama todavía no te da ningún rango — solo te manda el enlace correcto para inscribirte en Academia. Puedes confirmarlo en cualquier momento con **/academia**."
         },
         {
           "type": 14,
@@ -45,11 +45,11 @@
         },
         {
           "type": 10,
-          "content": "## <:ATC:1534071009060061214> 3. Academia\n\nEntrá a **atc24espanol.lat/academia/pilotos** o **/academia/atc** (según tu rama) y completá tu inscripción, que incluye un examen de admisión. Cuando un instructor lo apruebe, recibís automáticamente tu primer rol de **estudiante** (ATO para ATC, APA para Piloto)."
+          "content": "## <:ATC:1534071009060061214> 3. Academia\n\nEntra a **atc24espanol.lat/academia/pilotos** o **/academia/atc** (según tu rama) y completa tu inscripción, que incluye un examen de admisión. Cuando un instructor lo apruebe, recibes automáticamente tu primer rol de **estudiante** (ATO para ATC, APA para Piloto)."
         },
         {
           "type": 10,
-          "content": "A partir de ahí seguís tus lecciones y evaluaciones desde la web: podés ver el temario, marcar tu progreso, y cuando estés listo, presentarte a evaluación con un instructor. Todo tu avance — lecciones completadas, evaluaciones rendidas, certificados obtenidos — queda registrado en tu perfil de la web y también accesible desde Discord con **/academia**."
+          "content": "A partir de ahí sigues tus lecciones y evaluaciones desde la web: puedes ver el temario, marcar tu progreso, y cuando estés listo, presentarte a evaluación con un instructor. Todo tu avance — lecciones completadas, evaluaciones rendidas, certificados obtenidos — queda registrado en tu perfil de la web y también accesible desde Discord con **/academia**."
         },
         {
           "type": 14,
@@ -58,11 +58,11 @@
         },
         {
           "type": 10,
-          "content": "## <:brujula:1534077767958663329> 4. Rangos y apodo\n\nCuando completás tu formación y un instructor te asciende, obtenés tu primer rango real (**S1** para ATC, **PPA** para Piloto) junto con tu rol base (**ATC** o **FLT**). A partir de ahí, cada ascenso posterior sigue el mismo mecanismo.\n\nTu apodo en Discord se actualiza automáticamente para reflejar tu rango, siguiendo la guía oficial de prefijos del servidor. Si en algún momento lo ves desactualizado (por ejemplo, después de un ascenso reciente), corrélo vos mismo con **/apodo** — no hace falta esperar a que lo arregle el staff."
+          "content": "## <:brujula:1534077767958663329> 4. Rangos y apodo\n\nCuando completas tu formación y un instructor te asciende, obtienes tu primer rango real (**S1** para ATC, **PPA** para Piloto) junto con tu rol base (**ATC** o **FLT**). A partir de ahí, cada ascenso posterior sigue el mismo mecanismo.\n\nTu apodo en Discord se actualiza automáticamente para reflejar tu rango, siguiendo la guía oficial de prefijos del servidor. Si en algún momento lo ves desactualizado (por ejemplo, después de un ascenso reciente), corrígelo tú mismo con **/apodo** — no hace falta esperar a que lo arregle el staff."
         },
         {
           "type": 10,
-          "content": "```fix\nJerarquía y prefijos:\n  Staff / Instructor van primero (si tenés)\n  Después tu rango operativo más alto\n  Máximo 2 prefijos, formato PREFIJO | Nombre\n```"
+          "content": "```fix\nJerarquía y prefijos:\n  Staff / Instructor van primero (si tienes)\n  Después tu rango operativo más alto\n  Máximo 2 prefijos, formato PREFIJO | Nombre\n```"
         },
         {
           "type": 14,
@@ -71,7 +71,7 @@
         },
         {
           "type": 10,
-          "content": "## <:antena:1534070807792324659> 5. Operando en Red/Torre\n\n**Si sos ATC:** abrí una posición de control desde la web (**Red → Torre**), eligiendo aeropuerto, tipo de posición y frecuencia. El bot publica automáticamente el anuncio en el canal de ATC y te crea acceso a los canales correspondientes del aeródromo. Cuando termines, cerrala desde la misma sección — la tabla de \"Controladores en línea\" del canal ATC se actualiza sola.\n\n**Si sos Piloto:** presentá tu plan de vuelo desde la web (**Red → Operaciones**) o directamente con **/vuelo**, sin salir de Discord. El plan queda publicado y se va actualizando solo (creado → autorizado → finalizado) a medida que avanza tu vuelo — no hace falta que edites nada a mano."
+          "content": "## <:antena:1534070807792324659> 5. Operando en Red/Torre\n\n**Si eres ATC:** abre una posición de control desde la web (**Red → Torre**), eligiendo aeropuerto, tipo de posición y frecuencia. El bot publica automáticamente el anuncio en el canal de ATC y te crea acceso a los canales correspondientes del aeródromo. Cuando termines, ciérrala desde la misma sección — la tabla de \"Controladores en línea\" del canal ATC se actualiza sola.\n\n**Si eres Piloto:** presenta tu plan de vuelo desde la web (**Red → Operaciones**) o directamente con **/vuelo**, sin salir de Discord. El plan queda publicado y se va actualizando solo (creado → autorizado → finalizado) a medida que avanza tu vuelo — no hace falta que edites nada a mano."
         },
         {
           "type": 14,
@@ -80,7 +80,7 @@
         },
         {
           "type": 10,
-          "content": "## <:chat:1534077571279360141> Comandos del bot\n\n**Para todos:**\n**/academia** — tu progreso, certificados y cola de evaluaciones (Instructores/Staff ven también la cola y pueden ascender desde ahí)\n**/apodo** — recalcula tu propio apodo\n**/vuelo** — presenta un plan de vuelo\n**/atc** — abre una posición de control\n**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n**/advertencia** — consultá tus advertencias registradas\n**/reportar** — abre un ticket privado de soporte\n\n**Para Instructores / Staff:**\n**/apodo-miembro** — actualiza el apodo de otro miembro\n**/advertir** — registra una advertencia formal a un usuario\n**/panel-soporte** — publica el panel fijo de tickets en un canal\n**/eco** — envía un mensaje formal en nombre del bot\n\n**Exclusivo para ATC:**\n**/panel-atc** — herramientas de Controlador (encuesta de interés en control, cierre forzado de posición, anuncios rápidos)\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**, visible solo para quien tiene permiso de ascender en esa categoría."
+          "content": "## <:chat:1534077571279360141> Comandos del bot\n\n**Para todos:**\n**/academia** — tu progreso, certificados y cola de evaluaciones (Instructores/Staff ven también la cola y pueden ascender desde ahí)\n**/apodo** — recalcula tu propio apodo\n**/vuelo** — presenta un plan de vuelo\n**/atc** — abre una posición de control\n**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n**/advertencia** — consulta tus advertencias registradas\n**/reportar** — abre un ticket privado de soporte\n\n**Para Instructores / Staff:**\n**/apodo-miembro** — actualiza el apodo de otro miembro\n**/advertir** — registra una advertencia formal a un usuario\n**/panel-soporte** — publica el panel fijo de tickets en un canal\n**/eco** — envía un mensaje formal en nombre del bot\n\n**Exclusivo para ATC:**\n**/panel-atc** — herramientas de Controlador (encuesta de interés en control, cierre forzado de posición, anuncios rápidos)\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**, visible solo para quien tiene permiso de ascender en esa categoría."
         },
         {
           "type": 14,
@@ -89,7 +89,7 @@
         },
         {
           "type": 10,
-          "content": "-# ¿Dudas que esta guía no responde? Abrí un ticket con **/reportar** y te ayuda Staff."
+          "content": "-# ¿Dudas que esta guía no responde? Abre un ticket con **/reportar** y te ayuda Staff."
         }
       ]
     }
