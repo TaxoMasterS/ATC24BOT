@@ -143,6 +143,10 @@ DISCORD_CHANNEL_MOD_LOG = os.environ.get("DISCORD_CHANNEL_MOD_LOG")
 DISCORD_CHANNEL_CONTEO = os.environ.get("DISCORD_CHANNEL_CONTEO") or "1406796261817979001"
 DISCORD_CHANNEL_FOTO_SEMANA = os.environ.get("DISCORD_CHANNEL_FOTO_SEMANA") or "1238796825960386617"
 
+# Canal adicional donde también se avisa cuando alguien solicita que se abra
+# una posición ATC (además del canal ATC normal).
+CANAL_SOLICITUD_CONTROL_EXTRA = os.environ.get("CANAL_SOLICITUD_CONTROL_EXTRA") or "1535448653236404265"
+
 # ─── Paleta de marca (ATC24 Español) — usada en accent_color de todos los
 # mensajes Components V2 y en los discord.Embed, para que se vea consistente
 # en vez de colores genéricos de Discord.
@@ -953,7 +957,7 @@ async def _procesar_ascenso(interaction: discord.Interaction, miembro: discord.M
 
     if not _puede_ascender(interaction.user, categoria):
         await interaction.followup.send(
-            "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Liderazgo).",
+            "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Staff).",
             ephemeral=True,
         )
         return
@@ -1010,7 +1014,7 @@ async def _procesar_ascenso(interaction: discord.Interaction, miembro: discord.M
 #         return
 #     if not _puede_ascender(interaction.user, categoria):
 #         await interaction.response.send_message(
-#             "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Liderazgo).",
+#             "No tienes permiso para otorgar ese rango (necesitas ser Instructor de esa rama o Staff).",
 #             ephemeral=True,
 #         )
 #         return
@@ -1046,7 +1050,7 @@ async def apodo(interaction: discord.Interaction):
 @app_commands.describe(miembro="Usuario a actualizar")
 async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
-        await interaction.response.send_message("Este comando es solo para Liderazgo/Staff.", ephemeral=True)
+        await interaction.response.send_message("Este comando es solo para Staff.", ephemeral=True)
         return
 
     try:
@@ -1268,7 +1272,7 @@ class AcademiaView(discord.ui.View):
     @discord.ui.button(label="Cola de evaluaciones", style=discord.ButtonStyle.secondary, emoji="📋")
     async def cola_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-            await interaction.response.send_message("Esta opción es solo para Instructores/Liderazgo.", ephemeral=True)
+            await interaction.response.send_message("Esta opción es solo para Instructores/Staff.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         try:
@@ -1401,7 +1405,7 @@ async def servidor(interaction: discord.Interaction):
 @app_commands.describe(miembro="Usuario a advertir", motivo="Motivo de la advertencia")
 async def advertir(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1423,11 +1427,15 @@ async def advertir(interaction: discord.Interaction, miembro: discord.Member, mo
     )
 
     try:
-        await miembro.send(
-            "Recibiste una advertencia en **ATC24 Español**.\n"
-            f"**Motivo:** {motivo}\n"
-            "Si crees que fue un error, contacta a Liderazgo."
+        embed_dm = discord.Embed(
+            title=f"{E['cruz']} Recibiste una advertencia",
+            description="Se registró una advertencia formal a tu nombre en **ATC24 Español**. Por favor, evitá que se repita.",
+            color=0xB0413E,
         )
+        embed_dm.add_field(name="Motivo", value=motivo, inline=False)
+        embed_dm.add_field(name="Total de advertencias", value=str(total), inline=True)
+        embed_dm.set_footer(text="¿Crees que fue un error? Abrí un ticket con /reportar.")
+        await miembro.send(embed=embed_dm)
     except discord.Forbidden:
         pass  # MD cerrados — no rompe el flujo, la advertencia ya quedó registrada
 
@@ -1442,12 +1450,12 @@ async def advertir(interaction: discord.Interaction, miembro: discord.Member, mo
             await canal_log.send(embed=embed_log)
 
 
-@tree.command(name="advertencia", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Liderazgo")
+@tree.command(name="advertencia", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Staff")
 @app_commands.describe(usuario="Usuario a consultar (déjalo vacío para ver las tuyas)")
 async def advertencia(interaction: discord.Interaction, usuario: discord.Member = None):
     objetivo = usuario or interaction.user
     if usuario and usuario.id != interaction.user.id and not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-        await interaction.response.send_message("Solo Instructores/Liderazgo pueden ver las advertencias de otra persona.", ephemeral=True)
+        await interaction.response.send_message("Solo Instructores/Staff pueden ver las advertencias de otra persona.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1642,7 +1650,7 @@ class TicketPanelView(discord.ui.View):
 @tree.command(name="panel-soporte", description="Publica en este canal el panel fijo para abrir tickets de soporte")
 async def panel_soporte(interaction: discord.Interaction):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
-        await interaction.response.send_message("Este comando es solo para Liderazgo.", ephemeral=True)
+        await interaction.response.send_message("Este comando es solo para Staff.", ephemeral=True)
         return
     embed = discord.Embed(
         title="Soporte ATC24 Español",
@@ -1680,7 +1688,7 @@ async def eco(
     usuario: discord.Member = None,
 ):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-        await interaction.response.send_message("Este comando es solo para Instructores/Liderazgo.", ephemeral=True)
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
         return
     if canal and usuario:
         await interaction.response.send_message("Elegí solo uno: un canal O un usuario, no ambos.", ephemeral=True)
@@ -1838,6 +1846,8 @@ def _construir_payload_atc_abierto(op: dict, actor_id: str):
         f"**Posición:** {op.get('positionType') or '---'}",
         f"**Frecuencia:** {op.get('frequency') or '---.---'}",
         f"**Controla:** <@{actor_id}>",
+        "",
+        "¡Únanse a volar! https://www.roblox.com/share?code=b8ff9e346139a142a3d1f42c0d9398a9&type=Server",
     ]
     return {
         "flags": 32768,
@@ -1907,6 +1917,16 @@ async def _evento_atc(request):
 # payload sin depender de que la web vuelva a mandarlo.
 _tabla_atc_message_id = None
 _tabla_atc_ultimos_activos: list = []
+# Sin este lock, dos reposts casi simultáneos (ej. dos mensajes seguidos en
+# el canal, o un mensaje justo cuando la web también avisó un cambio) pueden
+# leer el mismo _tabla_atc_message_id ANTES de que ninguno lo actualice, y
+# terminan publicando dos mensajes nuevos en vez de uno — la tabla se ve
+# duplicada. El lock serializa los reposts para que eso no pase.
+_tabla_atc_lock = asyncio.Lock()
+# IDs de mensajes viejos de la tabla que no se pudieron borrar (ej. rate
+# limit de Discord al borrar) — se reintenta en el PRÓXIMO repost, para que
+# no queden mensajes duplicados stackeados para siempre en el canal.
+_tabla_atc_pendientes_borrar: list = []
 
 SOLICITAR_CONTROL_CUSTOM_ID = "atc24:solicitar_control"
 
@@ -1961,26 +1981,47 @@ async def _repostear_tabla_atc(activos: list):
     nuevo — usado tanto por el endpoint que llama la web (cuando cambia una
     posición) como por on_message (cuando llega cualquier mensaje nuevo al
     canal, para que la tabla quede siempre última)."""
-    global _tabla_atc_message_id, _tabla_atc_ultimos_activos
-    _tabla_atc_ultimos_activos = activos
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-    payload = _construir_payload_tabla_atc(activos)
+    global _tabla_atc_message_id, _tabla_atc_ultimos_activos, _tabla_atc_pendientes_borrar
+    async with _tabla_atc_lock:
+        _tabla_atc_ultimos_activos = activos
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+        payload = _construir_payload_tabla_atc(activos)
 
-    async with aiohttp.ClientSession() as session:
+        a_borrar = list(_tabla_atc_pendientes_borrar)
         if _tabla_atc_message_id:
-            await session.delete(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{_tabla_atc_message_id}",
-                headers=headers,
-            )
-        async with session.post(
-            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
-            headers=headers, json=payload,
-        ) as resp:
-            if resp.status >= 300:
-                detalle = await resp.text()
-                raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
-            data = await resp.json()
-            _tabla_atc_message_id = data["id"]
+            a_borrar.append(_tabla_atc_message_id)
+        _tabla_atc_pendientes_borrar = []
+
+        async with aiohttp.ClientSession() as session:
+            # Antes esto no chequeaba el resultado del delete — si Discord
+            # devolvía un error (ej. 429 por rate limit, muy probable acá
+            # porque se repostea en CADA mensaje del canal), el mensaje viejo
+            # quedaba sin borrar y el nuevo se publicaba igual, dejando dos
+            # tablas visibles a la vez. Ahora, si falla, se reintenta en el
+            # próximo repost en vez de abandonarlo.
+            for msg_id in a_borrar:
+                try:
+                    async with session.delete(
+                        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{msg_id}",
+                        headers=headers,
+                    ) as resp_del:
+                        if resp_del.status not in (204, 404):
+                            detalle = await resp_del.text()
+                            print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {resp_del.status} {detalle}")
+                            _tabla_atc_pendientes_borrar.append(msg_id)
+                except Exception as err:
+                    print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {err}")
+                    _tabla_atc_pendientes_borrar.append(msg_id)
+
+            async with session.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+                headers=headers, json=payload,
+            ) as resp:
+                if resp.status >= 300:
+                    detalle = await resp.text()
+                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+                data = await resp.json()
+                _tabla_atc_message_id = data["id"]
 
 
 async def _evento_tabla_atc(request):
@@ -2022,10 +2063,7 @@ async def _procesar_solicitud_control(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Tu solicitud fue enviada a los controladores disponibles.", ephemeral=True
     )
-    if not DISCORD_CHANNEL_ATC:
-        return
 
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "flags": 32768,
         "allowed_mentions": {"parse": [], "roles": [str(ATC_ROLE_ID)]},
@@ -2036,26 +2074,19 @@ async def _procesar_solicitud_control(interaction: discord.Interaction):
                 "components": [
                     {
                         "type": 10,
-                        "content": (
-                            f"<@&{ATC_ROLE_ID}> {interaction.user.mention} solicitó formalmente "
-                            "la apertura de una posición de control."
-                        ),
+                        "content": f"<@&{ATC_ROLE_ID}> {interaction.user.mention} quiere que se abra una posición ATC.",
                     },
                 ],
             }
         ],
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
-                headers=headers, json=payload,
-            ) as resp:
-                if resp.status >= 300:
-                    detalle = await resp.text()
-                    print(f"ERROR al notificar solicitud de control: {resp.status} {detalle}")
-    except Exception as err:
-        print(f"ERROR al notificar solicitud de control: {err}")
+    for canal_id in {DISCORD_CHANNEL_ATC, CANAL_SOLICITUD_CONTROL_EXTRA}:
+        if not canal_id:
+            continue
+        try:
+            await _publicar_payload_crudo(int(canal_id), payload)
+        except Exception as err:
+            print(f"ERROR al notificar solicitud de control en el canal {canal_id}: {err}")
 
 
 # ─── Panel de ATC — comando /panel-atc, solo visible/usable para ATCs ─────
@@ -2074,21 +2105,18 @@ def _construir_payload_encuesta_control(votos_si: int = 0, votos_no: int = 0):
                 "type": 17,
                 "accent_color": BRAND_SKY_NAVY,
                 "components": [
-                    {"type": 10, "content": "**Encuesta formal — apertura de posición**"},
-                    {"type": 14, "divider": True, "spacing": 1},
                     {
                         "type": 10,
                         "content": (
-                            f"<@&{ATC_ROLE_ID}> Se solicita confirmar interés en que se habilite una posición "
-                            f"de control en este momento. Por favor, emitan su voto a continuación.\n\n"
-                            f"Votos actuales — Sí: {votos_si} · No: {votos_no}"
+                            f"<@&{ATC_ROLE_ID}> **¿Quieren que se abra control ahora?** Votá abajo.\n\n"
+                            f"Sí: {votos_si} · No: {votos_no}"
                         ),
                     },
                     {
                         "type": 1,
                         "components": [
-                            {"type": 2, "style": 3, "label": "Sí, solicito control", "custom_id": ENCUESTA_CONTROL_CUSTOM_SI},
-                            {"type": 2, "style": 4, "label": "No, por ahora no", "custom_id": ENCUESTA_CONTROL_CUSTOM_NO},
+                            {"type": 2, "style": 3, "label": "Sí", "custom_id": ENCUESTA_CONTROL_CUSTOM_SI},
+                            {"type": 2, "style": 4, "label": "No", "custom_id": ENCUESTA_CONTROL_CUSTOM_NO},
                         ],
                     },
                 ],
@@ -2133,11 +2161,12 @@ class AnuncioATCModal(discord.ui.Modal, title="Anuncio rápido a ATC"):
         if not DISCORD_CHANNEL_ATC:
             await interaction.response.send_message("El canal ATC no está configurado.", ephemeral=True)
             return
+        contenido = f"{str(self.texto)}\n\n-# Publicado por {interaction.user.mention}"
         payload = {
             "flags": 32768,
             "allowed_mentions": {"parse": []},
             "components": [
-                {"type": 17, "accent_color": BRAND_SKY_NAVY, "components": [{"type": 10, "content": str(self.texto)}]}
+                {"type": 17, "accent_color": BRAND_SKY_NAVY, "components": [{"type": 10, "content": contenido}]}
             ],
         }
         try:
@@ -2450,6 +2479,10 @@ async def _procesar_mensaje_conteo(message: discord.Message):
     _guardar_json("conteo.json", _estado_conteo)
 
 
+_TABLA_ATC_REPOST_COOLDOWN = 3  # segundos — evita golpear el rate limit de Discord si el canal está activo
+_tabla_atc_ultimo_repost_ts = 0.0
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -2458,7 +2491,16 @@ async def on_message(message: discord.Message):
     # Canal ATC: cualquier mensaje nuevo dispara un repost de la tabla de
     # controladores en línea, para que quede siempre como el último mensaje
     # del canal (mismo mecanismo que usa la web cuando cambia una posición).
-    if DISCORD_CHANNEL_ATC and message.channel.id == int(DISCORD_CHANNEL_ATC):
+    # Con cooldown corto: postear en cadena por cada mensaje de una charla
+    # activa satura el rate limit de Discord para ese canal, y eso era lo que
+    # hacía fallar el delete y dejaba la tabla vieja duplicada.
+    global _tabla_atc_ultimo_repost_ts
+    if (
+        DISCORD_CHANNEL_ATC
+        and message.channel.id == int(DISCORD_CHANNEL_ATC)
+        and asyncio.get_running_loop().time() - _tabla_atc_ultimo_repost_ts > _TABLA_ATC_REPOST_COOLDOWN
+    ):
+        _tabla_atc_ultimo_repost_ts = asyncio.get_running_loop().time()
         try:
             await _repostear_tabla_atc(_tabla_atc_ultimos_activos)
         except Exception as err:

@@ -62,7 +62,7 @@
         },
         {
           "type": 10,
-          "content": "```fix\nJerarquía y prefijos:\n  Liderazgo / Instructor van primero (si tenés)\n  Después tu rango operativo más alto\n  Máximo 2 prefijos, formato PREFIJO | Nombre\n```"
+          "content": "```fix\nJerarquía y prefijos:\n  Staff / Instructor van primero (si tenés)\n  Después tu rango operativo más alto\n  Máximo 2 prefijos, formato PREFIJO | Nombre\n```"
         },
         {
           "type": 14,
@@ -80,7 +80,7 @@
         },
         {
           "type": 10,
-          "content": "## <:chat:1534077571279360141> Comandos del bot\n\n**Para todos:**\n**/academia** — tu progreso, certificados y cola de evaluaciones (Instructores/Liderazgo ven también la cola y pueden ascender desde ahí)\n**/apodo** — recalcula tu propio apodo\n**/vuelo** — presenta un plan de vuelo\n**/atc** — abre una posición de control\n**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n**/advertencia** — consultá tus advertencias registradas\n**/reportar** — abre un ticket privado de soporte\n\n**Para Instructores / Liderazgo / Staff:**\n**/apodo-miembro** — actualiza el apodo de otro miembro\n**/advertir** — registra una advertencia formal a un usuario\n**/panel-soporte** — publica el panel fijo de tickets en un canal\n**/eco** — envía un mensaje formal en nombre del bot\n\n**Exclusivo para ATC:**\n**/panel-atc** — herramientas de Controlador (encuesta de interés en control, cierre forzado de posición, anuncios rápidos)\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**, visible solo para quien tiene permiso de ascender en esa categoría."
+          "content": "## <:chat:1534077571279360141> Comandos del bot\n\n**Para todos:**\n**/academia** — tu progreso, certificados y cola de evaluaciones (Instructores/Staff ven también la cola y pueden ascender desde ahí)\n**/apodo** — recalcula tu propio apodo\n**/vuelo** — presenta un plan de vuelo\n**/atc** — abre una posición de control\n**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n**/advertencia** — consultá tus advertencias registradas\n**/reportar** — abre un ticket privado de soporte\n\n**Para Instructores / Staff:**\n**/apodo-miembro** — actualiza el apodo de otro miembro\n**/advertir** — registra una advertencia formal a un usuario\n**/panel-soporte** — publica el panel fijo de tickets en un canal\n**/eco** — envía un mensaje formal en nombre del bot\n\n**Exclusivo para ATC:**\n**/panel-atc** — herramientas de Controlador (encuesta de interés en control, cierre forzado de posición, anuncios rápidos)\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**, visible solo para quien tiene permiso de ascender en esa categoría."
         },
         {
           "type": 14,
