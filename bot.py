@@ -308,13 +308,23 @@ def _strip_prefix(nombre: str) -> str:
 
 _bloxlink_cache = {}  # discord_id -> (nombre_roblox, expira_en)
 BLOXLINK_CACHE_TTL = 300  # 5 minutos — evita golpear la API de Bloxlink en /apodo-todos
+_bloxlink_avisado_sin_guild_id = False  # para loguear el aviso de GUILD_ID faltante una sola vez
 
 
 async def _roblox_username(discord_id: int):
     """Nombre real de Roblox ya verificado en Bloxlink para este Discord ID,
     o None si no está configurado / no se pudo resolver (nunca rompe el
     cálculo del apodo — solo cae a usar el nombre de Discord)."""
-    if not BLOXLINK_API_KEY or not GUILD_ID:
+    if not BLOXLINK_API_KEY:
+        return None
+    if not GUILD_ID:
+        # Hace falta SÍ o SÍ, aparte de la key — la API de Bloxlink es por
+        # servidor. Se loguea una sola vez (no en cada llamada) para que no
+        # quede en absoluto silencio por qué nunca aparece el nombre real.
+        global _bloxlink_avisado_sin_guild_id
+        if not _bloxlink_avisado_sin_guild_id:
+            _bloxlink_avisado_sin_guild_id = True
+            print("Aviso: BLOXLINK_API_KEY está configurada pero falta DISCORD_GUILD_ID — sin eso no se puede consultar Bloxlink, así que el apodo/los mensajes de vuelo siguen mostrando el nombre de Discord.")
         return None
     ahora = asyncio.get_running_loop().time()
     cacheado = _bloxlink_cache.get(discord_id)
@@ -326,16 +336,36 @@ async def _roblox_username(discord_id: int):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
             async with session.get(url, headers=headers) as resp:
                 if resp.status != 200:
+                    detalle = await resp.text()
+                    print(f"Aviso: Bloxlink respondió {resp.status} al consultar {discord_id}: {detalle}")
                     return None
                 data = await resp.json()
+
+            roblox_id = (data or {}).get("robloxID")
+            if not roblox_id:
+                print(f"Aviso: Bloxlink respondió OK para {discord_id} pero sin robloxID (¿el usuario no se verificó con Bloxlink?): {data}")
+                return None
+
+            # Bloxlink solo devuelve el ID numérico de Roblox — el nombre
+            # real hay que resolverlo aparte contra la API pública de Roblox
+            # (antes el código asumía un formato de respuesta de Bloxlink
+            # que incluía el nombre directo — resolved.roblox.name — pero la
+            # API real solo manda {"robloxID": "..."}, así que esto nunca
+            # devolvía nada).
+            async with session.get(f"https://users.roblox.com/v1/users/{roblox_id}") as resp2:
+                if resp2.status != 200:
+                    detalle = await resp2.text()
+                    print(f"Aviso: la API de Roblox respondió {resp2.status} al resolver el ID {roblox_id}: {detalle}")
+                    return None
+                datos_roblox = await resp2.json()
     except Exception as err:
-        print(f"Aviso: no pude consultar Bloxlink para {discord_id}: {err}")
+        print(f"Aviso: no pude consultar Bloxlink/Roblox para {discord_id}: {err}")
         return None
-    resolved = (data or {}).get("resolved") or {}
-    roblox = resolved.get("roblox") or {}
-    nombre = roblox.get("name") or roblox.get("displayName")
-    if nombre:
-        _bloxlink_cache[discord_id] = (nombre, ahora + BLOXLINK_CACHE_TTL)
+
+    nombre = datos_roblox.get("name") or datos_roblox.get("displayName")
+    if not nombre:
+        return None
+    _bloxlink_cache[discord_id] = (nombre, ahora + BLOXLINK_CACHE_TTL)
     return nombre
 
 
