@@ -128,13 +128,50 @@ DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS")
 # Rol que puede ver/gestionar TODOS los tickets, además de Liderazgo. Opcional
 # — si no está configurado, solo Liderazgo ve los tickets nuevos.
 SOPORTE_ROLE_ID = int(os.environ["SOPORTE_ROLE_ID"]) if os.environ.get("SOPORTE_ROLE_ID") else None
-# Categoría de Discord donde se crean los canales de ticket. Opcional — si no
-# está configurada, el bot busca/crea una categoría llamada "Tickets" sola.
-TICKETS_CATEGORY_ID = int(os.environ["TICKETS_CATEGORY_ID"]) if os.environ.get("TICKETS_CATEGORY_ID") else None
+# Categoría de Discord donde se crean los canales de ticket. Configurable por
+# variable de entorno; si no está seteada, cae a la categoría real del
+# servidor.
+TICKETS_CATEGORY_ID = int(os.environ["TICKETS_CATEGORY_ID"]) if os.environ.get("TICKETS_CATEGORY_ID") else 1238796826317164625
 # Canal donde se registra cada advertencia (/advertir), además de quedar
 # guardada en la web. Opcional — si no está configurado, solo queda el
 # registro en la web y la respuesta ephemeral al moderador.
 DISCORD_CHANNEL_MOD_LOG = os.environ.get("DISCORD_CHANNEL_MOD_LOG")
+
+# Canal del juego de conteo (estilo countingbot.com) y canal de "foto de la
+# semana". Configurables por variable de entorno; si no están seteadas, caen
+# a los canales reales del servidor.
+DISCORD_CHANNEL_CONTEO = os.environ.get("DISCORD_CHANNEL_CONTEO") or "1406796261817979001"
+DISCORD_CHANNEL_FOTO_SEMANA = os.environ.get("DISCORD_CHANNEL_FOTO_SEMANA") or "1238796825960386617"
+
+# ─── Paleta de marca (ATC24 Español) — usada en accent_color de todos los
+# mensajes Components V2 y en los discord.Embed, para que se vea consistente
+# en vez de colores genéricos de Discord.
+BRAND_SKY_NAVY = 0x0B2545
+BRAND_RADAR_GREEN = 0x3DDC97
+BRAND_BEACON_AMBER = 0xFFB400
+BRAND_RUNWAY_WHITE = 0xF5F7FA
+
+# ─── Carpeta de datos persistentes (contador de tickets, conteo, foto de la
+# semana) — sobrevive reinicios normales del proceso; se pierde si Render
+# hace un redeploy completo (disco efímero), igual que el resto del bot no
+# garantiza persistencia entre despliegues.
+CARPETA_DATOS = os.path.join(CARPETA_SCRIPT, "data")
+os.makedirs(CARPETA_DATOS, exist_ok=True)
+
+
+def _leer_json(nombre: str, default: dict) -> dict:
+    ruta = os.path.join(CARPETA_DATOS, nombre)
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(default)
+
+
+def _guardar_json(nombre: str, data: dict) -> None:
+    ruta = os.path.join(CARPETA_DATOS, nombre)
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 # Emojis reales del servidor (mismos que ya se usan del lado de la web) —
 # se usan en vez de emojis Unicode genéricos en todos los mensajes.
@@ -174,12 +211,15 @@ ARCHIVO_GUIA_BLOXLINK = os.path.join(CARPETA_SCRIPT, "payloads", "guia_bloxlink.
 # misma lista, solo el primero (más alto) se usa en el apodo, y el resto se
 # retira automáticamente (ver enforce_single_rank_per_category).
 
+STF_ROLE_ID = 1238796825415389286
+PM_ROLE_ID = 1238796825390092358
+
 LIDERAZGO_ORDER = [
     1238796825415389288,  # CEO
     1238796825415389287,  # EXO
     1238796825402544150,  # DEV
-    1238796825415389286,  # STF
-    1238796825390092358,  # PM
+    STF_ROLE_ID,           # STF
+    PM_ROLE_ID,             # PM
 ]
 
 # No son jerárquicos entre sí (un instructor puede tener varios a la vez);
@@ -639,6 +679,7 @@ async def iniciar_servidor_web():
 
 
 _presencia_iniciada = False  # evita arrancar el loop dos veces si on_ready se dispara de nuevo (reconexión)
+_foto_semana_iniciada = False  # mismo motivo, para el loop de votación semanal
 # Unix epoch en milisegundos — formato que espera Discord en timestamps.start
 # (documentado), más seguro que pasar un datetime como kwarg suelto.
 _BOT_START_MS = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
@@ -686,16 +727,104 @@ async def _actualizar_presencia_loop():
         await asyncio.sleep(40)  # rota cada 40s entre las 6 variantes (~4 min por vuelta completa)
 
 
+# ─── Foto de la semana ─────────────────────────────────────────────────────
+# Nominación: cualquiera puede marcar una foto con ⭐ en el canal
+# correspondiente — queda en espera hasta el viernes, cuando el bot publica
+# un mensaje de votación con todas las nominadas de esa semana (votación por
+# reacción 👍, sin selección automática de ganador por ahora).
+_estado_foto_semana = _leer_json("foto_semana.json", {"nominadas": [], "ultima_publicacion": None})
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == client.user.id:
+        return
+    if str(payload.channel_id) != str(DISCORD_CHANNEL_FOTO_SEMANA):
+        return
+    if str(payload.emoji) != "⭐":
+        return
+
+    if any(n["message_id"] == payload.message_id for n in _estado_foto_semana["nominadas"]):
+        return  # ya estaba nominada
+
+    try:
+        canal = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
+        mensaje = await canal.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+
+    tiene_imagen = (
+        any((a.content_type or "").startswith("image/") for a in mensaje.attachments)
+        or any(e.type == "image" for e in mensaje.embeds)
+    )
+    if not tiene_imagen:
+        return
+
+    _estado_foto_semana["nominadas"].append({
+        "message_id": mensaje.id,
+        "author_id": mensaje.author.id,
+        "jump_url": mensaje.jump_url,
+    })
+    _guardar_json("foto_semana.json", _estado_foto_semana)
+
+
+async def _publicar_votacion_foto_semana():
+    nominadas = _estado_foto_semana["nominadas"]
+    if not nominadas or not DISCORD_CHANNEL_FOTO_SEMANA:
+        return
+
+    lineas = [
+        "**Votación — Foto de la semana**",
+        "",
+        "Reaccioná con 👍 en tu foto favorita de las nominadas esta semana:",
+        "",
+    ]
+    for i, n in enumerate(nominadas, start=1):
+        lineas.append(f"{i}. <@{n['author_id']}> — {n['jump_url']}")
+
+    payload = {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {"type": 17, "accent_color": BRAND_BEACON_AMBER, "components": [{"type": 10, "content": "\n".join(lineas)}]},
+        ],
+    }
+    try:
+        await _publicar_payload_crudo(int(DISCORD_CHANNEL_FOTO_SEMANA), payload)
+    except Exception as err:
+        print(f"ERROR al publicar la votación de foto de la semana: {err}")
+        return
+
+    _estado_foto_semana["nominadas"] = []
+    _estado_foto_semana["ultima_publicacion"] = datetime.date.today().isoformat()
+    _guardar_json("foto_semana.json", _estado_foto_semana)
+
+
+async def _foto_semana_loop():
+    while True:
+        try:
+            hoy = datetime.date.today()
+            ya_publicado_hoy = _estado_foto_semana.get("ultima_publicacion") == hoy.isoformat()
+            if hoy.weekday() == 4 and not ya_publicado_hoy:  # 4 = viernes
+                await _publicar_votacion_foto_semana()
+        except Exception as err:
+            print(f"Aviso: fallo en el loop de foto de la semana: {err}")
+        await asyncio.sleep(1800)  # revisa cada 30 min
+
+
 @client.event
 async def on_ready():
     print(f"Conectado como {client.user} (id {client.user.id})")
     print("Esperando el comando !publicar-verificacion en algún canal…")
     print("El bot debe seguir corriendo para poder reaccionar a los clics del botón.\n")
 
-    global _presencia_iniciada
+    global _presencia_iniciada, _foto_semana_iniciada
     if not _presencia_iniciada:
         _presencia_iniciada = True
         client.loop.create_task(_actualizar_presencia_loop())
+    if not _foto_semana_iniciada:
+        _foto_semana_iniciada = True
+        client.loop.create_task(_foto_semana_loop())
 
 
 @client.event
@@ -720,7 +849,13 @@ async def setup_hook():
             guild_obj = discord.Object(id=int(GUILD_ID))
             tree.copy_global_to(guild=guild_obj)
             await tree.sync(guild=guild_obj)
-            print(f"Slash commands sincronizados al servidor {GUILD_ID} (instantáneo).")
+            # Purga cualquier comando global viejo (de antes de configurar
+            # GUILD_ID, o de un despliegue anterior) — si no se limpia,
+            # Discord muestra ESE comando global además del que acabamos de
+            # sincronizar al servidor, y aparece duplicado en el selector "/".
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            print(f"Slash commands sincronizados al servidor {GUILD_ID} (instantáneo) y comandos globales viejos purgados.")
         else:
             await tree.sync()
             print("Slash commands sincronizados globalmente (puede tardar ~1h en propagarse).")
@@ -756,12 +891,12 @@ async def on_member_join(member: discord.Member):
             try:
                 tarjeta = await generar_tarjeta_bienvenida(member)
                 archivo = discord.File(tarjeta, filename="bienvenida.png")
-                embed = discord.Embed(description=saludo, color=discord.Color.blue())
+                embed = discord.Embed(description=saludo, color=BRAND_SKY_NAVY)
                 embed.set_image(url="attachment://bienvenida.png")
                 await canal.send(embed=embed, file=archivo)
             except FileNotFoundError as err:
                 print(f"Aviso: {err} — mando la bienvenida sin tarjeta por ahora.")
-                embed = discord.Embed(description=saludo, color=discord.Color.blue())
+                embed = discord.Embed(description=saludo, color=BRAND_SKY_NAVY)
                 if member.guild.icon:
                     embed.set_thumbnail(url=member.guild.icon.url)
                 await canal.send(embed=embed)
@@ -779,7 +914,7 @@ async def _mandar_eleccion_de_rama_por_dm(member: discord.Member):
             "Cuando quieras, elige por dónde comenzar tu camino en la red. "
             "Esto te verifica en el servidor y te envía el enlace para inscribirte en Academia."
         ),
-        color=discord.Color.blue(),
+        color=BRAND_SKY_NAVY,
     )
     try:
         await member.send(embed=embed_dm, view=BienvenidaView())
@@ -883,7 +1018,7 @@ async def _procesar_ascenso(interaction: discord.Interaction, miembro: discord.M
 #     await _procesar_ascenso(interaction, miembro, role_id)
 
 
-@tree.command(name="apodo", description="Actualiza tu propio apodo según tus roles actuales")
+@tree.command(name="apodo", description="Actualiza tu apodo según tu rango y roles actuales")
 async def apodo(interaction: discord.Interaction):
     member = interaction.user
     try:
@@ -907,7 +1042,7 @@ async def apodo(interaction: discord.Interaction):
         await interaction.response.send_message(f"Tu apodo ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@tree.command(name="apodo-miembro", description="Actualiza el apodo de otro usuario según su jerarquía de roles")
+@tree.command(name="apodo-miembro", description="Actualiza el apodo de otro miembro del servidor según su jerarquía de roles")
 @app_commands.describe(miembro="Usuario a actualizar")
 async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
@@ -997,7 +1132,7 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
 
 async def _embed_progreso(usuario) -> discord.Embed:
     data = await _consulta_web(f"/api/bot/user-progress/{usuario.id}")
-    embed = discord.Embed(title="Tu progreso en Academia", color=discord.Color.blurple())
+    embed = discord.Embed(title="Tu progreso en Academia", color=BRAND_RADAR_GREEN)
 
     if not data.get("enrollments"):
         embed.description = f"{E['libro']} Todavía no te inscribiste en ninguna rama de Academia. Elige tu rama desde el mensaje que recibiste por mensaje directo al verificarte."
@@ -1040,7 +1175,7 @@ async def _embed_certificados(objetivo):
 
     items = sorted(items, key=lambda c: CERT_TYPE_ORDEN.get(c["type"], 9))
     por_rama = _agrupar_por_rama(items)
-    embed = discord.Embed(title=f"Certificados de {objetivo.display_name}", description=E["verificado"], color=discord.Color.gold())
+    embed = discord.Embed(title=f"Certificados de {objetivo.display_name}", description=E["verificado"], color=BRAND_BEACON_AMBER)
     for rama in BRANCH_ORDER:
         certs = por_rama.get(rama, [])
         if not certs:
@@ -1057,7 +1192,7 @@ async def _embed_cola(rama_valor=None):
         return None, f"{E['check']} No hay evaluaciones pendientes ahora mismo."
 
     por_rama = _agrupar_por_rama(items)
-    embed = discord.Embed(title="Evaluaciones pendientes de revisar", description=E["chat"], color=discord.Color.orange())
+    embed = discord.Embed(title="Evaluaciones pendientes de revisar", description=E["chat"], color=BRAND_BEACON_AMBER)
     for r in BRANCH_ORDER:
         pendientes = por_rama.get(r, [])
         if not pendientes:
@@ -1153,7 +1288,7 @@ class AcademiaView(discord.ui.View):
         )
 
 
-@tree.command(name="academia", description="Progreso, certificados, cola de evaluaciones y ascensos de Academia")
+@tree.command(name="academia", description="Consulta tu progreso, certificados, cola de evaluaciones y ascensos en Academia")
 async def academia(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Elige qué quieres ver:", view=AcademiaView(interaction.user), ephemeral=True,
@@ -1255,7 +1390,7 @@ async def servidor(interaction: discord.Interaction):
     except Exception as err:
         await interaction.followup.send(f"No pude consultar el estado del servidor: {err}")
         return
-    embed = discord.Embed(title="Estado de ATC24 Español", description=E["antena"], color=discord.Color.blurple())
+    embed = discord.Embed(title="Estado de ATC24 Español", description=E["antena"], color=BRAND_SKY_NAVY)
     embed.add_field(name="Vuelos activos", value=str(data.get("activeFlights", 0)), inline=True)
     embed.add_field(name="Controladores en línea", value=str(data.get("activeControllers", 0)), inline=True)
     embed.add_field(name="Verificados", value=f"{data.get('verifiedUsers', 0)} / {data.get('totalUsers', 0)}", inline=True)
@@ -1299,7 +1434,7 @@ async def advertir(interaction: discord.Interaction, miembro: discord.Member, mo
     if DISCORD_CHANNEL_MOD_LOG:
         canal_log = client.get_channel(int(DISCORD_CHANNEL_MOD_LOG))
         if canal_log:
-            embed_log = discord.Embed(title=f"{E['cruz']} Nueva advertencia", color=discord.Color.orange())
+            embed_log = discord.Embed(title=f"{E['cruz']} Nueva advertencia", color=0xB0413E)
             embed_log.add_field(name="Usuario", value=miembro.mention, inline=True)
             embed_log.add_field(name="Por", value=interaction.user.mention, inline=True)
             embed_log.add_field(name="Total acumulado", value=str(total), inline=True)
@@ -1327,7 +1462,7 @@ async def advertencia(interaction: discord.Interaction, usuario: discord.Member 
         await interaction.followup.send(f"{objetivo.mention} no tiene advertencias registradas.", ephemeral=True)
         return
 
-    embed = discord.Embed(title=f"Advertencias de {objetivo.display_name}", color=discord.Color.orange())
+    embed = discord.Embed(title=f"Advertencias de {objetivo.display_name}", color=0xB0413E)
     for w in items[:10]:
         fecha = datetime.datetime.fromtimestamp(w["at"] / 1000, tz=datetime.timezone.utc).strftime("%d/%m/%Y")
         quien = w.get("moderatorName") or w.get("moderatorId") or "—"
@@ -1365,6 +1500,17 @@ def _slug_canal(nombre: str) -> str:
     return (s or "usuario")[:80]
 
 
+def _siguiente_numero_ticket() -> int:
+    """Contador global persistente — cada ticket nuevo (de cualquier
+    usuario) se lleva el siguiente número de la secuencia, sin importar
+    cuántos tickets tenga abiertos o cerrados cada quien."""
+    estado = _leer_json("tickets_contador.json", {"siguiente": 1})
+    numero = estado["siguiente"]
+    estado["siguiente"] = numero + 1
+    _guardar_json("tickets_contador.json", estado)
+    return numero
+
+
 async def _categoria_tickets(guild: discord.Guild):
     if TICKETS_CATEGORY_ID:
         cat = guild.get_channel(TICKETS_CATEGORY_ID)
@@ -1397,6 +1543,7 @@ async def _crear_ticket(interaction: discord.Interaction, motivo: str, descripci
 
     categoria = await _categoria_tickets(guild)
     rol_soporte = guild.get_role(SOPORTE_ROLE_ID) if SOPORTE_ROLE_ID else None
+    rol_stf = guild.get_role(STF_ROLE_ID)
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1406,12 +1553,19 @@ async def _crear_ticket(interaction: discord.Interaction, motivo: str, descripci
     if rol_soporte:
         overwrites[rol_soporte] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
     else:
+        # Public Manager (PM) queda excluido a propósito — no debe ver
+        # tickets aunque forme parte de Liderazgo.
         for rid in LIDERAZGO_ORDER:
+            if rid == PM_ROLE_ID:
+                continue
             rol = guild.get_role(rid)
             if rol:
                 overwrites[rol] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    if rol_stf:
+        overwrites[rol_stf] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-    nombre_canal = f"ticket-{_slug_canal(interaction.user.display_name)}"
+    numero_ticket = _siguiente_numero_ticket()
+    nombre_canal = f"{_slug_canal(interaction.user.display_name)}_{numero_ticket:03d}"
     try:
         canal = await guild.create_text_channel(
             nombre_canal, category=categoria, overwrites=overwrites,
@@ -1426,13 +1580,17 @@ async def _crear_ticket(interaction: discord.Interaction, motivo: str, descripci
 
     _tickets_abiertos[interaction.user.id] = canal.id
 
-    embed = discord.Embed(title=f"{E['chat']} Ticket de soporte", description=descripcion, color=discord.Color.blurple())
+    embed = discord.Embed(title=f"{E['chat']} Ticket de soporte", description=descripcion, color=BRAND_SKY_NAVY)
     embed.add_field(name="Abierto por", value=interaction.user.mention, inline=True)
     embed.add_field(name="Motivo", value=motivo, inline=True)
     embed.set_footer(text="ATC24 Español")
 
     mencion_staff = rol_soporte.mention if rol_soporte else " ".join(f"<@&{rid}>" for rid in LIDERAZGO_ORDER[:1])
-    await canal.send(content=f"{interaction.user.mention} {mencion_staff}", embed=embed, view=TicketCanalView())
+    mencion_stf = rol_stf.mention if rol_stf else f"<@&{STF_ROLE_ID}>"
+    await canal.send(
+        content=f"{interaction.user.mention} {mencion_staff} {mencion_stf}",
+        embed=embed, view=TicketCanalView(),
+    )
     await interaction.followup.send(f"Listo, tu ticket quedó en {canal.mention}.", ephemeral=True)
 
 
@@ -1489,21 +1647,29 @@ async def panel_soporte(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Soporte ATC24 Español",
         description=(
-            f"{E['chat']} ¿Tienes un problema, una duda o quieres reportar algo?\n"
-            "Presiona el botón para abrir un ticket privado — solo tú y el staff lo van a poder ver."
+            f"{E['chat']} ¿Tienes un problema, una duda o algo para reportar? Presiona el botón de abajo "
+            "y se va a crear un canal privado — solo lo van a poder ver vos y el staff.\n\n"
+            "**Algunos motivos comunes para abrir un ticket:**\n"
+            "• Reportar un error o mal funcionamiento del bot o de la web.\n"
+            "• Pedir ayuda con la verificación de Bloxlink.\n"
+            "• Consultar o disputar tu rango, rama o apodo.\n"
+            "• Reportar a otro usuario por una falta de conducta.\n"
+            "• Cualquier duda sobre Academia, evaluaciones o ascensos.\n"
+            "• Cualquier otra situación que prefieras tratar en privado con el staff.\n\n"
+            "Contanos con el mayor detalle posible qué pasó — así el staff puede ayudarte más rápido."
         ),
-        color=discord.Color.blurple(),
+        color=BRAND_SKY_NAVY,
     )
     await interaction.channel.send(embed=embed, view=TicketPanelView())
     await interaction.response.send_message("Panel de soporte publicado en este canal.", ephemeral=True)
 
 
-@tree.command(name="reportar", description="Abre un ticket privado de soporte para reportar algo")
+@tree.command(name="reportar", description="Abre un ticket privado de soporte para reportar una incidencia")
 async def reportar(interaction: discord.Interaction):
     await interaction.response.send_modal(TicketModal())
 
 
-@tree.command(name="eco", description="Manda un mensaje formal como el bot (a un canal, por MD, o en el mismo canal)")
+@tree.command(name="eco", description="Envía un mensaje formal en nombre del bot (a un canal, por mensaje directo, o en este mismo canal)")
 @app_commands.describe(
     canal="Canal donde publicarlo (si se deja vacío junto con usuario, se manda en este mismo canal)",
     usuario="Usuario a quien mandárselo por MD",
@@ -1556,27 +1722,27 @@ ESTADO_VUELO_LABEL = {
     # un webhook con un mensaje suelto sin relación con este (ver
     # discordNotifier.js). Ahora es el primer estado de este mismo mensaje,
     # que después se va editando en el lugar (autorizado → finalizado/etc.).
-    "FlightCreated": (f"{E['avion']} Nuevo plan de vuelo", 0x3ddc97),
-    "FlightApproved": (f"{E['check']} Vuelo autorizado", 0x3ddc97),
-    "FlightCompleted": (f"{E['brujula']} Vuelo finalizado", 0x4aa3ff),
-    "FlightWithdrawn": (f"{E['cruz']} Vuelo retirado", 0xe5484d),
-    "FlightEdited": (f"{E['flecha']} Plan de vuelo editado", 0xf5a623),
+    "FlightCreated": ("Nuevo plan de vuelo", BRAND_BEACON_AMBER),
+    "FlightApproved": ("Vuelo autorizado", BRAND_RADAR_GREEN),
+    "FlightCompleted": ("Vuelo finalizado", 0x2A9D74),
+    "FlightWithdrawn": ("Vuelo retirado", 0xB0413E),
+    "FlightEdited": ("Plan de vuelo editado", BRAND_SKY_NAVY),
 }
 
 
 def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
-    estado_label, color = ESTADO_VUELO_LABEL.get(tipo, ("Plan de vuelo actualizado", 2872707))
-    lineas = [f"{E['antena']} **Discord:** <@{actor_id}>"]
+    estado_label, color = ESTADO_VUELO_LABEL.get(tipo, ("Plan de vuelo actualizado", BRAND_SKY_NAVY))
+    lineas = [f"**Discord:** <@{actor_id}>"]
     if roblox_name:
-        lineas.append(f"{E['antena']} **Roblox:** {roblox_name}")
+        lineas.append(f"**Roblox:** {roblox_name}")
     lineas.extend([
-        f"{E['avion']} **Callsign:** {op.get('callsign') or '—'}",
-        f"{E['avion']} **Aircraft:** {op.get('aircraftType') or '—'}",
-        f"{E['libro']} **Flight Rules:** {op.get('flightRules') or '—'}",
-        f"{E['flecha']} **Departing:** {op.get('departure') or '—'}",
-        f"{E['brujula']} **Arriving:** {op.get('destination') or '—'}",
-        f"{E['flecha']} **Route:** {op.get('route') or 'OWN NAV'}",
-        f"{E['flecha']} **Flight Level:** {op.get('level') or '—'}",
+        f"**Callsign:** {op.get('callsign') or '—'}",
+        f"**Aircraft:** {op.get('aircraftType') or '—'}",
+        f"**Flight Rules:** {op.get('flightRules') or '—'}",
+        f"**Departing:** {op.get('departure') or '—'}",
+        f"**Arriving:** {op.get('destination') or '—'}",
+        f"**Route:** {op.get('route') or 'OWN NAV'}",
+        f"**Flight Level:** {op.get('level') or '—'}",
     ])
     # Campos opcionales — sólo aparecen si el plan realmente los tiene
     # cargados (squawk/pista los asigna control al autorizar, no siempre
@@ -1588,7 +1754,7 @@ def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
     ]
     for etiqueta, valor in opcionales:
         if valor:
-            lineas.append(f"{E['atc']} **{etiqueta}:** {valor}")
+            lineas.append(f"**{etiqueta}:** {valor}")
     return {
         "flags": 32768,
         "allowed_mentions": {"parse": []},
@@ -1597,7 +1763,7 @@ def _construir_payload_vuelo(op: dict, actor_id: str, tipo: str, roblox_name):
                 "type": 17,
                 "accent_color": color,
                 "components": [
-                    {"type": 10, "content": f"# {estado_label}"},
+                    {"type": 10, "content": f"**{estado_label}**"},
                     {"type": 14, "divider": True, "spacing": 1},
                     {"type": 10, "content": "\n".join(lineas)},
                 ],
@@ -1677,7 +1843,7 @@ def _construir_payload_atc_abierto(op: dict, actor_id: str):
         "flags": 32768,
         "allowed_mentions": {"parse": [], "roles": [str(V_ROLE_ID)]},
         "components": [
-            {"type": 17, "accent_color": 0x3ddc97, "components": [{"type": 10, "content": "\n".join(lineas)}]},
+            {"type": 17, "accent_color": BRAND_RADAR_GREEN, "components": [{"type": 10, "content": "\n".join(lineas)}]},
         ],
     }
 
@@ -1732,22 +1898,28 @@ async def _evento_atc(request):
 
 
 # ─── Tabla "ATC Online" — un único mensaje, siempre el último del canal ───
-# La web ya no la arma por webhook: le manda la lista de posiciones activas
-# a este endpoint cada vez que alguien abre o cierra una posición, y el bot
-# borra el mensaje anterior (si existe) y publica uno nuevo — así queda
-# garantizado que hay un solo mensaje y que siempre es el más reciente.
+# La web le manda la lista de posiciones activas a este endpoint cada vez
+# que alguien abre o cierra una posición, y el bot borra el mensaje anterior
+# (si existe) y publica uno nuevo. Además, cualquier mensaje humano nuevo en
+# el canal ATC dispara el mismo repost (ver on_message) para que la tabla
+# quede siempre como el último mensaje del canal — por eso se guarda también
+# la última lista de activos recibida, para poder reconstruir el mismo
+# payload sin depender de que la web vuelva a mandarlo.
 _tabla_atc_message_id = None
+_tabla_atc_ultimos_activos: list = []
+
+SOLICITAR_CONTROL_CUSTOM_ID = "atc24:solicitar_control"
 
 
 def _construir_payload_tabla_atc(activos: list):
     if not activos:
-        lineas = [f"{E['antena']} No hay ninguna posición ATC abierta ahora mismo."]
+        lineas = ["No hay ninguna posición ATC abierta ahora mismo."]
     else:
         por_aeropuerto = {}
         for op in activos:
             ap = op.get("airport") or "----"
             por_aeropuerto.setdefault(ap, []).append(op)
-        lineas = [f"{E['antena']} {len(activos)} posición(es) abierta(s) ahora mismo", ""]
+        lineas = [f"{len(activos)} posición(es) abierta(s) ahora mismo", ""]
         for ap in sorted(por_aeropuerto):
             lineas.append(f"**{ap}**")
             for op in por_aeropuerto[ap]:
@@ -1762,19 +1934,56 @@ def _construir_payload_tabla_atc(activos: list):
         "allowed_mentions": {"parse": []},
         "components": [
             {
-                "type": 17, "accent_color": 0x3ddc97,
+                "type": 17, "accent_color": BRAND_RADAR_GREEN,
                 "components": [
-                    {"type": 10, "content": "# Controladores en línea"},
+                    {"type": 10, "content": "**Controladores en línea**"},
                     {"type": 14, "divider": True, "spacing": 1},
                     {"type": 10, "content": "\n".join(lineas).strip()},
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 2,
+                                "style": 3,
+                                "label": "Solicitar apertura de posición",
+                                "custom_id": SOLICITAR_CONTROL_CUSTOM_ID,
+                            }
+                        ],
+                    },
                 ],
             },
         ],
     }
 
 
+async def _repostear_tabla_atc(activos: list):
+    """Borra el mensaje anterior de la tabla (si existe) y publica uno
+    nuevo — usado tanto por el endpoint que llama la web (cuando cambia una
+    posición) como por on_message (cuando llega cualquier mensaje nuevo al
+    canal, para que la tabla quede siempre última)."""
+    global _tabla_atc_message_id, _tabla_atc_ultimos_activos
+    _tabla_atc_ultimos_activos = activos
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    payload = _construir_payload_tabla_atc(activos)
+
+    async with aiohttp.ClientSession() as session:
+        if _tabla_atc_message_id:
+            await session.delete(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{_tabla_atc_message_id}",
+                headers=headers,
+            )
+        async with session.post(
+            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+            headers=headers, json=payload,
+        ) as resp:
+            if resp.status >= 300:
+                detalle = await resp.text()
+                raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+            data = await resp.json()
+            _tabla_atc_message_id = data["id"]
+
+
 async def _evento_tabla_atc(request):
-    global _tabla_atc_message_id
     if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
         return web.json_response({"error": "unauthorized"}, status=401)
     if not DISCORD_CHANNEL_ATC:
@@ -1784,30 +1993,235 @@ async def _evento_tabla_atc(request):
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
 
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-    payload = _construir_payload_tabla_atc(body.get("activeAtc") or [])
+    try:
+        await _repostear_tabla_atc(body.get("activeAtc") or [])
+    except Exception as err:
+        print(f"ERROR al actualizar la tabla de ATC Online: {err}")
+        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
 
-    async with aiohttp.ClientSession() as session:
-        if _tabla_atc_message_id:
-            await session.delete(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{_tabla_atc_message_id}",
-                headers=headers,
-            )
-        try:
+    return web.json_response({"ok": True})
+
+
+# ─── Solicitud formal de apertura de posición (botón en la tabla ATC) ─────
+_ultima_solicitud_control = {}  # discord_id -> timestamp de asyncio loop
+SOLICITUD_CONTROL_COOLDOWN = 300  # 5 minutos, evita spam del botón
+
+
+async def _procesar_solicitud_control(interaction: discord.Interaction):
+    ahora = asyncio.get_running_loop().time()
+    anterior = _ultima_solicitud_control.get(interaction.user.id)
+    if anterior and ahora - anterior < SOLICITUD_CONTROL_COOLDOWN:
+        restante = int(SOLICITUD_CONTROL_COOLDOWN - (ahora - anterior))
+        await interaction.response.send_message(
+            f"Ya solicitaste la apertura de una posición hace poco. Podés volver a hacerlo en {restante} segundos.",
+            ephemeral=True,
+        )
+        return
+
+    _ultima_solicitud_control[interaction.user.id] = ahora
+    await interaction.response.send_message(
+        "Tu solicitud fue enviada a los controladores disponibles.", ephemeral=True
+    )
+    if not DISCORD_CHANNEL_ATC:
+        return
+
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "flags": 32768,
+        "allowed_mentions": {"parse": [], "roles": [str(ATC_ROLE_ID)]},
+        "components": [
+            {
+                "type": 17,
+                "accent_color": BRAND_BEACON_AMBER,
+                "components": [
+                    {
+                        "type": 10,
+                        "content": (
+                            f"<@&{ATC_ROLE_ID}> {interaction.user.mention} solicitó formalmente "
+                            "la apertura de una posición de control."
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
                 headers=headers, json=payload,
             ) as resp:
                 if resp.status >= 300:
                     detalle = await resp.text()
-                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
-                data = await resp.json()
-                _tabla_atc_message_id = data["id"]
-        except Exception as err:
-            print(f"ERROR al actualizar la tabla de ATC Online: {err}")
-            return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
+                    print(f"ERROR al notificar solicitud de control: {resp.status} {detalle}")
+    except Exception as err:
+        print(f"ERROR al notificar solicitud de control: {err}")
 
-    return web.json_response({"ok": True})
+
+# ─── Panel de ATC — comando /panel-atc, solo visible/usable para ATCs ─────
+ENCUESTA_CONTROL_CUSTOM_SI = "atc24:encuesta_control:si"
+ENCUESTA_CONTROL_CUSTOM_NO = "atc24:encuesta_control:no"
+
+_votos_encuesta_control = {}  # message_id -> {"si": set(discord_id), "no": set(discord_id)}
+
+
+def _construir_payload_encuesta_control(votos_si: int = 0, votos_no: int = 0):
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": ["roles"]},
+        "components": [
+            {
+                "type": 17,
+                "accent_color": BRAND_SKY_NAVY,
+                "components": [
+                    {"type": 10, "content": "**Encuesta formal — apertura de posición**"},
+                    {"type": 14, "divider": True, "spacing": 1},
+                    {
+                        "type": 10,
+                        "content": (
+                            f"<@&{ATC_ROLE_ID}> Se solicita confirmar interés en que se habilite una posición "
+                            f"de control en este momento. Por favor, emitan su voto a continuación.\n\n"
+                            f"Votos actuales — Sí: {votos_si} · No: {votos_no}"
+                        ),
+                    },
+                    {
+                        "type": 1,
+                        "components": [
+                            {"type": 2, "style": 3, "label": "Sí, solicito control", "custom_id": ENCUESTA_CONTROL_CUSTOM_SI},
+                            {"type": 2, "style": 4, "label": "No, por ahora no", "custom_id": ENCUESTA_CONTROL_CUSTOM_NO},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+
+async def _procesar_voto_control(interaction: discord.Interaction, voto: str):
+    msg_id = interaction.message.id
+    registro = _votos_encuesta_control.setdefault(msg_id, {"si": set(), "no": set()})
+    otro = "no" if voto == "si" else "si"
+    registro[otro].discard(interaction.user.id)
+    registro[voto].add(interaction.user.id)
+
+    await interaction.response.send_message(
+        f"Tu voto (\"{'Sí' if voto == 'si' else 'No'}\") quedó registrado.", ephemeral=True
+    )
+
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    payload = _construir_payload_encuesta_control(len(registro["si"]), len(registro["no"]))
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.patch(
+                f"https://discord.com/api/v10/channels/{interaction.channel_id}/messages/{msg_id}",
+                headers=headers, json=payload,
+            )
+    except Exception as err:
+        print(f"ERROR al actualizar encuesta de control: {err}")
+
+
+class AnuncioATCModal(discord.ui.Modal, title="Anuncio rápido a ATC"):
+    texto = discord.ui.TextInput(
+        label="Mensaje",
+        style=discord.TextStyle.paragraph,
+        placeholder="Escribe el anuncio tal como quieres que se vea…",
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not DISCORD_CHANNEL_ATC:
+            await interaction.response.send_message("El canal ATC no está configurado.", ephemeral=True)
+            return
+        payload = {
+            "flags": 32768,
+            "allowed_mentions": {"parse": []},
+            "components": [
+                {"type": 17, "accent_color": BRAND_SKY_NAVY, "components": [{"type": 10, "content": str(self.texto)}]}
+            ],
+        }
+        try:
+            await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATC), payload)
+        except Exception as err:
+            await interaction.response.send_message(f"No pude publicar el anuncio: {err}", ephemeral=True)
+            return
+        await interaction.response.send_message("Anuncio publicado en el canal ATC.", ephemeral=True)
+
+
+class CerrarPosicionSelect(discord.ui.Select):
+    def __init__(self):
+        opciones = [
+            discord.SelectOption(
+                label=f"{op.get('airport') or '----'}_{op.get('positionType') or '---'}",
+                description=f"Controla: {op.get('controllerName') or op.get('ownerId') or '—'}"[:100],
+            )
+            for op in _tabla_atc_ultimos_activos[:25]  # límite de Discord para un Select
+        ]
+        super().__init__(placeholder="Posición a cerrar", options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        clave = self.values[0]
+        nuevos = [
+            op for op in _tabla_atc_ultimos_activos
+            if f"{op.get('airport') or '----'}_{op.get('positionType') or '---'}" != clave
+        ]
+        try:
+            await _repostear_tabla_atc(nuevos)
+        except Exception as err:
+            await interaction.response.send_message(f"No pude actualizar la tabla: {err}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Posición `{clave}` cerrada en la tabla de Discord. Esto solo corrige lo que se ve acá — "
+            "no cierra la posición del lado de la web.",
+            ephemeral=True,
+        )
+
+
+class CerrarPosicionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(CerrarPosicionSelect())
+
+
+class PanelATCView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="¿Quieren control? (encuesta)", style=discord.ButtonStyle.primary)
+    async def encuesta_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not DISCORD_CHANNEL_ATC:
+            await interaction.response.send_message("El canal ATC no está configurado.", ephemeral=True)
+            return
+        payload = _construir_payload_encuesta_control()
+        try:
+            await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATC), payload)
+        except Exception as err:
+            await interaction.response.send_message(f"No pude publicar la encuesta: {err}", ephemeral=True)
+            return
+        await interaction.response.send_message("Encuesta publicada en el canal ATC.", ephemeral=True)
+
+    @discord.ui.button(label="Cerrar posición a la fuerza", style=discord.ButtonStyle.danger)
+    async def cerrar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _tabla_atc_ultimos_activos:
+            await interaction.response.send_message("No hay ninguna posición registrada para cerrar ahora mismo.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Elegí la posición a cerrar:", view=CerrarPosicionView(), ephemeral=True,
+        )
+
+    @discord.ui.button(label="Anuncio rápido a ATC", style=discord.ButtonStyle.secondary)
+    async def anuncio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnuncioATCModal())
+
+
+@tree.command(name="panel-atc", description="Abre el panel de herramientas para Controladores de Tráfico Aéreo")
+async def panel_atc(interaction: discord.Interaction):
+    if not has_any_role(interaction.user, ATC_ORDER + [ATC_ROLE_ID]):
+        await interaction.response.send_message(
+            "Este comando es exclusivo para Controladores de Tráfico Aéreo.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message("Panel de ATC — elige una acción:", view=PanelATCView(), ephemeral=True)
 
 
 # ─── ATIS (Components V2, mismo formato ICAO estándar de antes) ───────────
@@ -1839,7 +2253,7 @@ def _construir_payload_atis(e: dict):
         "allowed_mentions": {"parse": []},
         "components": [
             {
-                "type": 17, "accent_color": 0xf5a623,
+                "type": 17, "accent_color": BRAND_BEACON_AMBER,
                 "components": [
                     {"type": 10, "content": f"# {E['microfono']} ATIS {ap}"},
                     {"type": 14, "divider": True, "spacing": 1},
@@ -1993,10 +2407,70 @@ async def _procesar_autorizacion(message: discord.Message):
         print(f"Aviso: no pude mandarle la autorización por MD a {autor} (tiene los MD cerrados).")
 
 
+# ─── Contador (juego de conteo, estilo countingbot.com) ───────────────────
+# Cada mensaje válido tiene que ser el número siguiente al actual, y nadie
+# puede postear dos veces seguidas — si se rompe cualquiera de las dos
+# reglas, la cuenta se reinicia a 0 (igual que countingbot.com). El estado
+# se guarda en disco para sobrevivir un reinicio normal del proceso.
+_estado_conteo = _leer_json("conteo.json", {"actual": 0, "ultimo_usuario_id": None})
+
+
+async def _procesar_mensaje_conteo(message: discord.Message):
+    texto = message.content.strip()
+    if not re.fullmatch(r"-?\d+", texto):
+        return  # no es un número — se ignora, no rompe la cuenta
+
+    numero = int(texto)
+    esperado = _estado_conteo["actual"] + 1
+    mismo_usuario = _estado_conteo["ultimo_usuario_id"] == message.author.id
+
+    if numero != esperado or mismo_usuario:
+        if mismo_usuario and numero == esperado:
+            motivo = "no podés contar dos veces seguidas"
+        else:
+            motivo = f"seguía el **{esperado}**"
+        try:
+            await message.add_reaction("❌")
+        except discord.HTTPException:
+            pass
+        await message.channel.send(
+            f"{message.author.mention} rompió la cuenta en **{numero}** — {motivo}. Se reinicia desde **0**."
+        )
+        _estado_conteo["actual"] = 0
+        _estado_conteo["ultimo_usuario_id"] = None
+        _guardar_json("conteo.json", _estado_conteo)
+        return
+
+    try:
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    _estado_conteo["actual"] = numero
+    _estado_conteo["ultimo_usuario_id"] = message.author.id
+    _guardar_json("conteo.json", _estado_conteo)
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # Canal ATC: cualquier mensaje nuevo dispara un repost de la tabla de
+    # controladores en línea, para que quede siempre como el último mensaje
+    # del canal (mismo mecanismo que usa la web cuando cambia una posición).
+    if DISCORD_CHANNEL_ATC and message.channel.id == int(DISCORD_CHANNEL_ATC):
+        try:
+            await _repostear_tabla_atc(_tabla_atc_ultimos_activos)
+        except Exception as err:
+            print(f"ERROR al reenviar la tabla de ATC Online tras un mensaje nuevo: {err}")
+
+    # Canal de conteo (estilo countingbot.com): hay que postear el número
+    # siguiente al actual, y nadie puede contar dos veces seguidas. Si se
+    # rompe la cuenta, vuelve a 0.
+    if message.channel.id == int(DISCORD_CHANNEL_CONTEO):
+        await _procesar_mensaje_conteo(message)
+        return
+
     comando = message.content.strip()
 
     # "!autorizar" — comando oculto que arma/desarma la captura del próximo
@@ -2052,7 +2526,18 @@ async def on_interaction(interaction: discord.Interaction):
     # Solo nos interesan los clics de botón con nuestro custom_id
     if interaction.type != discord.InteractionType.component:
         return
-    if interaction.data.get("custom_id") != CUSTOM_ID:
+
+    custom_id = interaction.data.get("custom_id")
+
+    if custom_id == SOLICITAR_CONTROL_CUSTOM_ID:
+        await _procesar_solicitud_control(interaction)
+        return
+
+    if custom_id in (ENCUESTA_CONTROL_CUSTOM_SI, ENCUESTA_CONTROL_CUSTOM_NO):
+        await _procesar_voto_control(interaction, "si" if custom_id == ENCUESTA_CONTROL_CUSTOM_SI else "no")
+        return
+
+    if custom_id != CUSTOM_ID:
         return
 
     guild = interaction.guild

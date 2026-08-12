@@ -8,6 +8,9 @@ venv/
 __pycache__/
 *.pyc
 
+# Estado runtime persistente (contador de tickets, conteo, foto de la semana)
+data/
+
 # Archivos del sistema
 .DS_Store
 Thumbs.db
