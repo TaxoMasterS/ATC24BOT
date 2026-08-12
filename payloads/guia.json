@@ -14,7 +14,7 @@
         },
         {
           "type": 10,
-          "content": "Esta guía explica, paso a paso, todo el recorrido: desde que te unes al servidor hasta que ya estás operando activamente como Piloto o Controlador. Guárdala — te va a servir de referencia más de una vez."
+          "content": "Guía paso a paso: desde que te unes al servidor hasta que ya estás operando como Piloto o Controlador. Guárdala como referencia."
         },
         {
           "type": 14,
@@ -71,7 +71,7 @@
         },
         {
           "type": 10,
-          "content": "## <:antena:1534070807792324659> 5. Operando en Red/Torre\n\n**Si eres ATC:** abre una posición de control desde la web (**Red → Torre**), eligiendo aeropuerto, tipo de posición y frecuencia. El bot publica automáticamente el anuncio en el canal de ATC y te crea acceso a los canales correspondientes del aeródromo. Cuando termines, ciérrala desde la misma sección — la tabla de \"Controladores en línea\" del canal ATC se actualiza sola.\n\n**Si eres Piloto:** presenta tu plan de vuelo desde la web (**Red → Operaciones**) o directamente con **/vuelo**, sin salir de Discord. El plan queda publicado y se va actualizando solo (creado → autorizado → finalizado) a medida que avanza tu vuelo — no hace falta que edites nada a mano."
+          "content": "## <:antena:1534070807792324659> 5. Operando en Red/Torre\n\n**Si eres ATC:** abre una posición desde la web (**Red → Torre**) eligiendo aeropuerto, posición y frecuencia. El bot anuncia la apertura y te da acceso a los canales del aeródromo. Al cerrarla, la tabla \"Controladores en línea\" se actualiza sola.\n\n**Si eres Piloto:** presenta tu plan desde la web (**Red → Operaciones**) o con **/vuelo**. El mensaje se va actualizando solo (creado → autorizado → finalizado) — no hace falta editar nada a mano."
         },
         {
           "type": 14,
@@ -80,7 +80,7 @@
         },
         {
           "type": 10,
-          "content": "## <:chat:1534077571279360141> Comandos del bot\n\n**Para todos:**\n**/academia** — tu progreso, certificados y cola de evaluaciones (Instructores/Staff ven también la cola y pueden ascender desde ahí)\n**/apodo** — recalcula tu propio apodo\n**/vuelo** — presenta un plan de vuelo\n**/atc** — abre una posición de control\n**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n**/advertencia** — consulta tus advertencias registradas\n**/reportar** — abre un ticket privado de soporte\n\n**Para Instructores / Staff:**\n**/apodo-miembro** — actualiza el apodo de otro miembro\n**/advertir** — registra una advertencia formal a un usuario\n**/panel-soporte** — publica el panel fijo de tickets en un canal\n**/eco** — envía un mensaje formal en nombre del bot\n\n**Exclusivo para ATC:**\n**/panel-atc** — herramientas de Controlador (encuesta de interés en control, cierre forzado de posición, anuncios rápidos)\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**, visible solo para quien tiene permiso de ascender en esa categoría."
+          "content": "## <:chat:1534077571279360141> Comandos del bot\n\nEscribe **!help** en cualquier canal para ver la lista completa y siempre actualizada de comandos, agrupada por a quién le sirve cada uno.\n\nLos ascensos de rango ya no se piden por comando aparte — se otorgan desde el botón **Ascender** dentro de **/academia**."
         },
         {
           "type": 14,
