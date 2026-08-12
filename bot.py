@@ -68,9 +68,11 @@ GUIA-hosting-render.md para el paso a paso completo.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import datetime
 import json
+import operator
 import os
 import random
 import re
@@ -1047,6 +1049,7 @@ async def apodo(interaction: discord.Interaction):
 
 
 @tree.command(name="apodo-miembro", description="Actualiza el apodo de otro miembro del servidor según su jerarquía de roles")
+@app_commands.default_permissions()
 @app_commands.describe(miembro="Usuario a actualizar")
 async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
@@ -1402,6 +1405,7 @@ async def servidor(interaction: discord.Interaction):
 
 
 @tree.command(name="advertir", description="Da una advertencia formal a un usuario (queda registrada en la web)")
+@app_commands.default_permissions()
 @app_commands.describe(miembro="Usuario a advertir", motivo="Motivo de la advertencia")
 async def advertir(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
@@ -1480,6 +1484,36 @@ async def advertencias(interaction: discord.Interaction, usuario: discord.Member
     else:
         embed.set_footer(text=f"Total: {len(items)}")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="borrar", description="Borra una cantidad de mensajes recientes de este canal")
+@app_commands.default_permissions()
+@app_commands.describe(cantidad="Cuántos mensajes borrar (entre 1 y 100)")
+async def borrar(interaction: discord.Interaction, cantidad: app_commands.Range[int, 1, 100]):
+    if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Esto solo funciona en canales de texto normales.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # Discord no permite borrado masivo de mensajes con más de 14 días —
+        # purge() los salta solos en vez de fallar, así que puede borrar
+        # menos de lo pedido si el canal está poco activo.
+        borrados = await interaction.channel.purge(limit=cantidad)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "No pude borrar mensajes — al bot le falta el permiso \"Gestionar mensajes\" en este canal.",
+            ephemeral=True,
+        )
+        return
+    except Exception as err:
+        await interaction.followup.send(f"No pude borrar los mensajes: {err}", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"Borré {len(borrados)} mensaje(s) de este canal.", ephemeral=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1648,6 +1682,7 @@ class TicketPanelView(discord.ui.View):
 
 
 @tree.command(name="panel-soporte", description="Publica en este canal el panel fijo para abrir tickets de soporte")
+@app_commands.default_permissions()
 async def panel_soporte(interaction: discord.Interaction):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
         await interaction.response.send_message("Este comando es solo para Staff.", ephemeral=True)
@@ -1678,6 +1713,7 @@ async def reportar(interaction: discord.Interaction):
 
 
 @tree.command(name="eco", description="Envía un mensaje formal en nombre del bot (a un canal, por mensaje directo, o en este mismo canal)")
+@app_commands.default_permissions()
 @app_commands.describe(
     canal="Canal donde publicarlo (si se deja vacío junto con usuario, se manda en este mismo canal)",
     usuario="Usuario a quien mandárselo por MD",
@@ -2261,6 +2297,7 @@ class PanelATCView(discord.ui.View):
 
 
 @tree.command(name="panel-atc", description="Abre el panel de herramientas para Controladores de Tráfico Aéreo")
+@app_commands.default_permissions()
 async def panel_atc(interaction: discord.Interaction):
     if not has_any_role(interaction.user, ATC_ORDER + [ATC_ROLE_ID]):
         await interaction.response.send_message(
@@ -2460,13 +2497,59 @@ async def _procesar_autorizacion(message: discord.Message):
 # se guarda en disco para sobrevivir un reinicio normal del proceso.
 _estado_conteo = _leer_json("conteo.json", {"actual": 0, "ultimo_usuario_id": None})
 
+# Operadores permitidos en fórmulas del canal de conteo (ej. "40+2", "6*7",
+# "100/4"). Nada de eval() — solo un subconjunto fijo de nodos aritméticos
+# de ast, así no hay forma de ejecutar código arbitrario.
+_CONTEO_OPERADORES = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _evaluar_formula_conteo(texto: str):
+    """Evalúa una fórmula aritmética simple de forma segura. Devuelve un
+    int si el resultado es un número entero, o None si el texto no es una
+    fórmula válida (o el resultado no da un entero exacto)."""
+    if len(texto) > 100:
+        return None  # fórmulas razonables no necesitan ser tan largas
+
+    def _nodo(n):
+        if isinstance(n, ast.Expression):
+            return _nodo(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in _CONTEO_OPERADORES:
+            izq, der = _nodo(n.left), _nodo(n.right)
+            if isinstance(n.op, ast.Pow) and abs(der) > 20:
+                raise ValueError("exponente demasiado grande")
+            return _CONTEO_OPERADORES[type(n.op)](izq, der)
+        if isinstance(n, ast.UnaryOp) and type(n.op) in _CONTEO_OPERADORES:
+            return _CONTEO_OPERADORES[type(n.op)](_nodo(n.operand))
+        raise ValueError("nodo no permitido")
+
+    try:
+        arbol = ast.parse(texto, mode="eval")
+        resultado = _nodo(arbol)
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return None
+
+    if not isinstance(resultado, (int, float)) or resultado != int(resultado):
+        return None
+    return int(resultado)
+
 
 async def _procesar_mensaje_conteo(message: discord.Message):
     texto = message.content.strip()
-    if not re.fullmatch(r"-?\d+", texto):
-        return  # no es un número — se ignora, no rompe la cuenta
-
-    numero = int(texto)
+    numero = _evaluar_formula_conteo(texto)
+    if numero is None:
+        return  # no es un número ni una fórmula válida — se ignora, no rompe la cuenta
     esperado = _estado_conteo["actual"] + 1
     mismo_usuario = _estado_conteo["ultimo_usuario_id"] == message.author.id
 
@@ -2555,6 +2638,7 @@ async def on_message(message: discord.Message):
             value=(
                 "**/apodo-miembro** — actualiza el apodo de otro miembro\n"
                 "**/advertir** — registra una advertencia formal a un usuario\n"
+                "**/borrar** — borra una cantidad de mensajes recientes del canal\n"
                 "**/panel-soporte** — publica el panel fijo de tickets en un canal\n"
                 "**/eco** — envía un mensaje formal en nombre del bot"
             ),
@@ -2570,12 +2654,111 @@ async def on_message(message: discord.Message):
             value=(
                 "**!publicar-verificacion** — publica el botón de verificación en este canal\n"
                 "**!publicar-guia** — publica la guía de uso de la web y el bot\n"
-                "**!publicar-guia-bloxlink** — publica la guía de verificación con Bloxlink"
+                "**!publicar-guia-bloxlink** — publica la guía de verificación con Bloxlink\n"
+                "**!funciones** — referencia técnica exhaustiva de todo lo que hace el bot"
             ),
             inline=False,
         )
         embed.set_footer(text="Los ascensos se otorgan desde el botón Ascender dentro de /academia.")
         await message.channel.send(embed=embed)
+        return
+
+    # "!funciones" — referencia técnica EXHAUSTIVA de todo lo que hace el
+    # bot, incluidas cosas que no aparecen en /help ni en las guías (botones,
+    # automatizaciones, comandos ocultos). Por eso queda solo para
+    # administradores, a diferencia de !help.
+    if comando.lower() == "!funciones":
+        if not message.author.guild_permissions.administrator:
+            await message.reply("Este comando es solo para administradores.", delete_after=8)
+            return
+
+        e1 = discord.Embed(title="Funciones del bot — 1/2: comandos", color=BRAND_SKY_NAVY)
+        e1.add_field(
+            name="Slash — para todos",
+            value=(
+                "**/academia** — menú con 4 botones: Mi progreso, Mis certificados, "
+                "Cola de evaluaciones (solo Instructor/Staff), Ascender (solo quien puede ascender)\n"
+                "**/apodo** — recalcula tu apodo (usa nombre real de Roblox vía Bloxlink si está configurado)\n"
+                "**/vuelo** — presenta un plan de vuelo (callsign, aeronave, salida, llegada, nivel, reglas, ruta, alterno, observaciones)\n"
+                "**/atc** — abre una posición ATC (aeropuerto, posición, frecuencia)\n"
+                "**/servidor** — embed con vuelos/controladores/verificados en vivo\n"
+                "**/advertencias [usuario]** — tus advertencias, o las de otro si eres Instructor/Staff\n"
+                "**/reportar** — abre modal → crea ticket privado"
+            ),
+            inline=False,
+        )
+        e1.add_field(
+            name="Slash — Instructores/Staff (ocultos del selector \"/\" para todos los demás)",
+            value=(
+                "**/apodo-miembro** — recalcula el apodo de otro miembro\n"
+                "**/advertir** — registra advertencia (web + canal de log + MD embed al usuario)\n"
+                "**/borrar** — purga de 1 a 100 mensajes del canal\n"
+                "**/panel-soporte** — publica el panel fijo de tickets (botón persistente)\n"
+                "**/eco** — modal de texto largo → lo publica el bot (canal, MD, o mismo canal)"
+            ),
+            inline=False,
+        )
+        e1.add_field(
+            name="Slash — exclusivo ATC (oculto del selector \"/\" para todos los demás)",
+            value=(
+                "**/panel-atc** — 3 botones: encuesta \"¿Quieren control?\" con conteo de votos en vivo, "
+                "cerrar una posición a la fuerza (solo en la tabla de Discord, no en la web), anuncio rápido con modal"
+            ),
+            inline=False,
+        )
+        e1.add_field(
+            name="Comandos de texto \"!\" (no son slash commands)",
+            value=(
+                "**!help** — lista pública de comandos\n"
+                "**!funciones** — este mismo listado (solo administradores)\n"
+                "**!publicar-verificacion / !publicar-guia / !publicar-guia-bloxlink** — publican los JSON fijos de payloads/ (solo administradores, se autoborran)\n"
+                "**!autorizar** — arma/desarma captura de autorización de vuelo en el canal; el próximo mensaje se interpreta como plan y la autorización se manda por MD; siempre se autoborra; oculto a propósito (solo administradores o rol ATC)"
+            ),
+            inline=False,
+        )
+        await message.channel.send(embed=e1)
+
+        e2 = discord.Embed(title="Funciones del bot — 2/2: automatizaciones", color=BRAND_SKY_NAVY)
+        e2.add_field(
+            name="Verificación y bienvenida",
+            value=(
+                "Al unirse: rol NV automático + tarjeta de bienvenida (imagen generada) + mensaje\n"
+                "Botón \"Acepto y confirmo\": NV→V + MD para elegir rama (Piloto/ATC)\n"
+                "Apodo con prefijo automático según jerarquía de roles (Staff/Instructor + rango operativo, máx. 2)\n"
+                "Rol base ATC/FLT se agrega o retira solo según si tienes algún rango de esa rama"
+            ),
+            inline=False,
+        )
+        e2.add_field(
+            name="Planes de vuelo y ATC",
+            value=(
+                "1 solo mensaje por vuelo, editado en cada estado (creado→autorizado→finalizado/retirado/editado), con lock por vuelo para evitar duplicados\n"
+                "Anuncio de posición ATC abierta, se autoborra sola tras la duración configurada\n"
+                "Tabla \"Controladores en línea\": 1 mensaje siempre al final del canal ATC, se reenvía tras cualquier mensaje nuevo (cooldown 3s) y reintenta el borrado si falla\n"
+                "Botón \"Solicitar apertura de posición\" en la tabla → avisa en canal dedicado, cooldown 5 min por usuario\n"
+                "ATIS publicado vía Components V2"
+            ),
+            inline=False,
+        )
+        e2.add_field(
+            name="Tickets, conteo y foto de la semana",
+            value=(
+                "Tickets: categoría fija, nombre usuario_número (contador global persistente), STF siempre pineado, Public Manager explícitamente excluido\n"
+                "Conteo: acepta número o fórmula matemática simple (+ - * / // % **), no repetir usuario, se reinicia a 0 si se rompe, reacciones ✅/❌, estado persistido\n"
+                "Foto de la semana: reaccionar ⭐ a una imagen la nomina, todos los viernes se publica una votación y se vacía la lista"
+            ),
+            inline=False,
+        )
+        e2.add_field(
+            name="Otras cosas menores",
+            value=(
+                "Rich presence del bot rota cada 40s entre 6 variantes con datos en vivo\n"
+                "Al arrancar: purga los slash commands globales viejos para no dejar duplicados en el selector\n"
+                "Comandos sensibles (borrar, advertir, apodo-miembro, panel-soporte, eco, panel-atc) ocultos por defecto — un administrador debe habilitarlos por rol desde Integraciones"
+            ),
+            inline=False,
+        )
+        await message.channel.send(embed=e2)
         return
 
     # "!autorizar" — comando oculto que arma/desarma la captura del próximo
