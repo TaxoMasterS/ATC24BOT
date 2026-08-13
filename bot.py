@@ -51,6 +51,8 @@ cada archivo en payloads/ (ver COMANDOS_PUBLICAR más abajo):
 
     !publicar-guia               guía general de la web y el bot
     !publicar-guia-bloxlink      guía de verificación con Bloxlink
+    !publicar-guia-vuelo         guía de cómo presentar un plan de vuelo
+    !publicar-guia-atis          guía de cómo leer el ATIS
 
 HOSTING EN RENDER (GRATIS, SIN TARJETA)
 -----------------------------------------
@@ -210,6 +212,8 @@ CUSTOM_ID_ATC = "atc24_bienvenida_atc"
 ARCHIVO_MENSAJE = os.path.join(CARPETA_SCRIPT, "payloads", "verificacion.json")
 ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "payloads", "guia.json")
 ARCHIVO_GUIA_BLOXLINK = os.path.join(CARPETA_SCRIPT, "payloads", "guia_bloxlink.json")
+ARCHIVO_GUIA_VUELO = os.path.join(CARPETA_SCRIPT, "payloads", "guia_plan_vuelo.json")
+ARCHIVO_GUIA_ATIS = os.path.join(CARPETA_SCRIPT, "payloads", "guia_atis.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
 # Cada lista va del rango MÁS ALTO al más bajo dentro de su categoría.
@@ -2400,6 +2404,8 @@ COMANDOS_PUBLICAR = {
     "!publicar-verificacion": ARCHIVO_MENSAJE,
     "!publicar-guia": ARCHIVO_GUIA,
     "!publicar-guia-bloxlink": ARCHIVO_GUIA_BLOXLINK,
+    "!publicar-guia-vuelo": ARCHIVO_GUIA_VUELO,
+    "!publicar-guia-atis": ARCHIVO_GUIA_ATIS,
 }
 
 
@@ -2685,6 +2691,8 @@ async def on_message(message: discord.Message):
                 "**!publicar-verificacion** — publica el botón de verificación en este canal\n"
                 "**!publicar-guia** — publica la guía de uso de la web y el bot\n"
                 "**!publicar-guia-bloxlink** — publica la guía de verificación con Bloxlink\n"
+                "**!publicar-guia-vuelo** — publica la guía de cómo presentar un plan de vuelo\n"
+                "**!publicar-guia-atis** — publica la guía de cómo leer el ATIS\n"
                 "**!funciones** — referencia técnica exhaustiva de todo lo que hace el bot"
             ),
             inline=False,
@@ -2741,7 +2749,7 @@ async def on_message(message: discord.Message):
             value=(
                 "**!help** — lista pública de comandos\n"
                 "**!funciones** — este mismo listado (solo administradores)\n"
-                "**!publicar-verificacion / !publicar-guia / !publicar-guia-bloxlink** — publican los JSON fijos de payloads/ (solo administradores, se autoborran)\n"
+                "**!publicar-verificacion / !publicar-guia / !publicar-guia-bloxlink / !publicar-guia-vuelo / !publicar-guia-atis** — publican los JSON fijos de payloads/ (solo administradores, se autoborran)\n"
                 "**!autorizar** — arma/desarma captura de autorización de vuelo en el canal; el próximo mensaje se interpreta como plan y la autorización se manda por MD; siempre se autoborra; oculto a propósito (solo administradores o rol ATC)"
             ),
             inline=False,

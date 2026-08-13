@@ -1,0 +1,67 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 730437,
+      "components": [
+        {
+          "type": 10,
+          "content": "# <:Avion:1534071045865341019> GUÍA — CÓMO PRESENTAR UN PLAN DE VUELO"
+        },
+        {
+          "type": 10,
+          "content": "Se presenta con **/vuelo** (o desde la web, en **Red → Operaciones**). Así se llena cada campo:"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 2
+        },
+        {
+          "type": 10,
+          "content": "## Campos obligatorios\n\n**Callsign** — tu indicativo de vuelo (ej. `TXM123`).\n\n**Aircraft** — tipo de aeronave, en código ICAO si lo sabes (ej. `A320`, `B738`). Si no lo sabes, escribe el nombre tal cual.\n\n**Salida / Llegada** — código ICAO de 4 letras del aeródromo de origen y destino (ej. `SKBO`, `SVMI`). No hace falta mayúsculas, el bot las pone solo.\n\n**Nivel** — tu nivel de crucero en formato `FLxxx` (ej. `FL350` = 35.000 pies)."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## Reglas de vuelo\n\n**IFR** (Instrument Flight Rules) — vuelas siguiendo instrucciones de control todo el trayecto, es lo normal para vuelos comerciales/de línea.\n\n**VFR** (Visual Flight Rules) — vuelas por referencia visual, fuera de espacio aéreo controlado salvo autorización expresa. Si no eliges, se toma IFR por defecto."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## Campos opcionales\n\n**Ruta** — waypoints/aerovías si tienes una ruta armada. Si lo dejas vacío, se asume **OWN NAV** (navegación propia, directo).\n\n**Alterno** — aeródromo alterno por si no puedes aterrizar en destino. Opcional pero recomendado en IFR.\n\n**Observaciones** — cualquier dato extra para control (ej. equipo especial, pedido particular)."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## Qué pasa después de presentarlo\n\nEl plan se publica como **un solo mensaje** que se va actualizando solo en el canal de vuelos: creado → autorizado → finalizado (o retirado/editado). No se edita a mano desde Discord.\n\nEl **squawk** (código de transponder) y a veces la **pista** los asigna control automáticamente al autorizar tu plan — no los pones vos.\n\nSi te equivocaste en algo, presenta un plan nuevo — el anterior se puede retirar desde la web."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "-# ¿Dudas? Escribe **!help** para ver el resto de los comandos, o abre un ticket con **/reportar**."
+        }
+      ]
+    }
+  ]
+}

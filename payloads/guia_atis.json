@@ -1,0 +1,61 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 730437,
+      "components": [
+        {
+          "type": 10,
+          "content": "# <:microfono:1534077647494316137> GUÍA — CÓMO LEER EL ATIS"
+        },
+        {
+          "type": 10,
+          "content": "El ATIS (Automatic Terminal Information Service) es la información fija de un aeródromo que control graba una vez y todos escuchan antes de contactar — así no hay que repetir viento, pista y presión en cada llamada. Este es un ATIS de ejemplo y qué significa cada línea:"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 2
+        },
+        {
+          "type": 10,
+          "content": "```\nSKBO ATIS INFO C TIME 1430Z\nDEP RWY 13R / ARR RWY 13L\nWIND 090/12 VIS CAVOK SKC\nQNH 1013\nTRANSITION LEVEL FL070\nACKNOWLEDGE RECEIPT OF INFORMATION C ON INITIAL CONTACT\nEND OF INFORMATION C\n```"
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## Línea por línea\n\n**`ATIS INFO C TIME 1430Z`** — letra identificadora del ATIS (aquí, **C**) y hora en que se generó, en horario Zulu/UTC. La letra cambia cada vez que se actualiza el ATIS — si escuchaste \"información B\" y ahora dice \"C\", es una versión nueva.\n\n**`DEP RWY / ARR RWY`** — pista en uso para despegues y para aterrizajes (pueden ser la misma o distintas)."
+        },
+        {
+          "type": 10,
+          "content": "**`WIND 090/12`** — viento: dirección en grados (090 = del este) y velocidad en nudos (12 kt).\n\n**`VIS CAVOK`** — visibilidad. **CAVOK** (Ceiling And Visibility OK) significa buen tiempo: visibilidad ≥10km, sin nubes bajas ni fenómenos significativos. Si no es CAVOK, acá va la visibilidad en metros/km.\n\n**`SKC`** — estado del cielo. **SKC** = Sky Clear (despejado). Otros valores típicos: FEW (pocas nubes), SCT (dispersas), BKN (nubosidad fragmentada), OVC (cielo cubierto)."
+        },
+        {
+          "type": 10,
+          "content": "**`QNH 1013`** — presión atmosférica ajustada a nivel del mar, en hectopascales. Se usa para calibrar el altímetro y que marque la altitud real sobre el terreno.\n\n**`TRANSITION LEVEL FL070`** — nivel de vuelo a partir del cual se deja de usar QNH y se pasa a presión estándar (1013). Por debajo, volás en altitud (referencia QNH); por encima, en nivel de vuelo (referencia estándar)."
+        },
+        {
+          "type": 10,
+          "content": "**`ACKNOWLEDGE RECEIPT...`** — es un recordatorio, no una línea que se lea al aire: en tu primer contacto con esa posición tenés que confirmar que escuchaste esta información (\"con información C\"), para que control sepa que ya tenés los datos y no haga falta repetirlos.\n\n**`END OF INFORMATION C`** — marca el final del mensaje grabado."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "-# ¿Dudas? Escribe **!help** para ver el resto de los comandos, o abre un ticket con **/reportar**."
+        }
+      ]
+    }
+  ]
+}
