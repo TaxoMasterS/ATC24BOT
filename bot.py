@@ -1769,6 +1769,111 @@ async def eco(
     await interaction.response.send_modal(EcoModal(destino))
 
 
+# ─── Guardia de rate limit para las llamadas REST crudas a Discord ─────────
+# discord.py maneja el rate limit solo para las llamadas que pasan por su
+# propio client.http — pero varias partes de este bot le pegan a la API de
+# Discord directo con aiohttp (ver más abajo) para no depender de la firma
+# interna de discord.py, que cambia entre versiones sin aviso. Esas llamadas
+# crudas NO tenían ningún manejo de 429: si Discord respondía "esperá X
+# segundos", el código lo ignoraba y seguía pegándole igual en el próximo
+# evento. Según la documentación de Discord (developers.discord.com/
+# developers/topics/rate-limits), una IP que acumula 10.000 respuestas
+# inválidas (401/403/429) en 10 minutos queda baneada por Cloudflare — eso es
+# el Error 1015 que vimos en producción, y ESTA era la causa real: no un bug
+# puntual, sino que ninguna llamada cruda respetaba el rate limit, y varias
+# de ellas (la tabla de ATC Online sobre todo) se disparan muy seguido.
+#
+# _discord_request centraliza TODAS esas llamadas: reutiliza una sola sesión
+# (en vez de abrir una por request), respeta Retry-After reintentando una
+# vez, y lleva la cuenta de respuestas inválidas en una ventana de 10
+# minutos. Si esa cuenta se acerca al límite real de Discord, el bot se
+# pausa SOLO — dejo de mandar llamadas crudas por un rato — en vez de
+# esperar a que Cloudflare lo bloquee. Es el freno de mano propio antes del
+# de ellos.
+import collections as _collections
+import time as _time
+
+_RATE_GUARD_WINDOW = 600      # 10 min — misma ventana que usa Discord/Cloudflare
+_RATE_GUARD_THRESHOLD = 5000  # nos frenamos a la mitad del límite real de Discord (10.000)
+_RATE_GUARD_PAUSE = 120       # cuánto dura la pausa una vez que nos frenamos
+_invalid_responses = _collections.deque()  # timestamps (monotonic) de 401/403/429
+_breaker_paused_until = 0.0
+_http_session: aiohttp.ClientSession | None = None
+
+
+class DiscordPausado(Exception):
+    """Se lanza cuando el freno de mano propio está activo — la llamada ni
+    se intenta, para no seguir sumando respuestas inválidas mientras
+    esperamos a que la ventana de 10 minutos se limpie sola."""
+
+
+def _rate_guard_registrar_invalido(status: int):
+    global _breaker_paused_until
+    ahora = _time.monotonic()
+    _invalid_responses.append(ahora)
+    while _invalid_responses and ahora - _invalid_responses[0] > _RATE_GUARD_WINDOW:
+        _invalid_responses.popleft()
+    print(f"AVISO: Discord respondió {status} en una llamada cruda ({len(_invalid_responses)} inválidas en los últimos {_RATE_GUARD_WINDOW}s).")
+    if len(_invalid_responses) >= _RATE_GUARD_THRESHOLD and ahora >= _breaker_paused_until:
+        _breaker_paused_until = ahora + _RATE_GUARD_PAUSE
+        print(
+            f"FRENO DE MANO: {len(_invalid_responses)} respuestas inválidas de Discord en los "
+            f"últimos {_RATE_GUARD_WINDOW}s — pausando TODAS las llamadas REST crudas por "
+            f"{_RATE_GUARD_PAUSE}s para no llegar al baneo de Cloudflare (10.000 en 10 min)."
+        )
+
+
+def _rate_guard_chequear():
+    ahora = _time.monotonic()
+    if ahora < _breaker_paused_until:
+        restante = round(_breaker_paused_until - ahora, 1)
+        raise DiscordPausado(f"pausado por rate limit propio, quedan {restante}s")
+
+
+async def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
+
+async def _discord_request(method: str, url: str, *, headers=None, json_body=None, reintentos_429: int = 1):
+    """Wrapper único para TODAS las llamadas REST crudas a Discord — ver el
+    comentario grande arriba de esta sección para el porqué. Devuelve
+    (status, data_json_o_None, texto_o_None). Lanza DiscordPausado si el
+    freno de mano propio está activo — el llamador decide cómo manejarlo
+    (normalmente: loguear y no hacer nada, como cualquier otro fallo
+    best-effort de estas llamadas)."""
+    _rate_guard_chequear()
+    session = await _get_http_session()
+    intentos = 0
+    while True:
+        async with session.request(method, url, headers=headers, json=json_body) as resp:
+            if resp.status == 429 and intentos < reintentos_429:
+                cuerpo = {}
+                try:
+                    cuerpo = await resp.json()
+                except Exception:
+                    pass
+                espera = cuerpo.get("retry_after")
+                if espera is None:
+                    espera = float(resp.headers.get("Retry-After", 1))
+                espera = min(float(espera), 10)  # nunca bloqueamos más de 10s de una
+                _rate_guard_registrar_invalido(429)
+                intentos += 1
+                await asyncio.sleep(espera)
+                continue
+            if resp.status in (401, 403, 429):
+                _rate_guard_registrar_invalido(resp.status)
+            data, texto = None, None
+            if resp.status != 204:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    texto = await resp.text()
+            return resp.status, data, texto
+
+
 async def _publicar_payload_crudo(channel_id: int, payload: dict):
     """Publica un mensaje Components V2 llamando directamente a la API REST
     de Discord (en vez de usar client.http.send_message, cuya firma interna
@@ -1777,15 +1882,12 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
         "Authorization": f"Bot {BOT_TOKEN}",
         "Content-Type": "application/json",
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            headers=headers,
-            json=payload,
-        ) as resp:
-            if resp.status >= 300:
-                detalle = await resp.text()
-                raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
+    status, data, texto = await _discord_request(
+        "POST", f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        headers=headers, json_body=payload,
+    )
+    if status >= 300:
+        raise RuntimeError(f"Discord respondió {status}: {texto or data}")
 
 
 # ─── Mensajes de plan de vuelo (Components V2, con nombre real de Roblox) ──
@@ -1869,25 +1971,21 @@ async def _enviar_o_editar_vuelo(op_uuid: str, payload: dict):
     async with _lock_para_vuelo(op_uuid):
         headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
         mensaje_id = _flight_message_ids.get(op_uuid)
-        async with aiohttp.ClientSession() as session:
-            if mensaje_id:
-                url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages/{mensaje_id}"
-                async with session.patch(url, headers=headers, json=payload) as resp:
-                    if resp.status < 300:
-                        return
-                    if resp.status != 404:
-                        detalle = await resp.text()
-                        raise RuntimeError(f"Discord respondió {resp.status} al editar: {detalle}")
-                    # 404 = lo borraron a mano — cae a crear uno nuevo abajo.
-                    _flight_message_ids.pop(op_uuid, None)
+        if mensaje_id:
+            url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages/{mensaje_id}"
+            status, data, texto = await _discord_request("PATCH", url, headers=headers, json_body=payload)
+            if status < 300:
+                return
+            if status != 404:
+                raise RuntimeError(f"Discord respondió {status} al editar: {texto or data}")
+            # 404 = lo borraron a mano — cae a crear uno nuevo abajo.
+            _flight_message_ids.pop(op_uuid, None)
 
-            url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages"
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status >= 300:
-                    detalle = await resp.text()
-                    raise RuntimeError(f"Discord respondió {resp.status} al crear: {detalle}")
-                data = await resp.json()
-                _flight_message_ids[op_uuid] = data["id"]
+        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FLIGHTS}/messages"
+        status, data, texto = await _discord_request("POST", url, headers=headers, json_body=payload)
+        if status >= 300:
+            raise RuntimeError(f"Discord respondió {status} al crear: {texto or data}")
+        _flight_message_ids[op_uuid] = data["id"]
 
 
 async def _evento_vuelo(request):
@@ -1964,16 +2062,13 @@ async def _evento_atc(request):
     payload = _construir_payload_atc_abierto(op, actor_id)
     headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
-                headers=headers, json=payload,
-            ) as resp:
-                if resp.status >= 300:
-                    detalle = await resp.text()
-                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
-                data = await resp.json()
-                mensaje_id = data["id"]
+        status, data, texto = await _discord_request(
+            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+            headers=headers, json_body=payload,
+        )
+        if status >= 300:
+            raise RuntimeError(f"Discord respondió {status}: {texto or data}")
+        mensaje_id = data["id"]
     except Exception as err:
         print(f"ERROR al mandar anuncio ATC: {err}")
         return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
@@ -1981,11 +2076,10 @@ async def _evento_atc(request):
     async def _autoborrar():
         await asyncio.sleep(duracion_min * 60)
         try:
-            async with aiohttp.ClientSession() as session:
-                await session.delete(
-                    f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{mensaje_id}",
-                    headers=headers,
-                )
+            await _discord_request(
+                "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{mensaje_id}",
+                headers=headers,
+            )
         except Exception:
             pass
 
@@ -2078,36 +2172,36 @@ async def _repostear_tabla_atc(activos: list):
             a_borrar.append(_tabla_atc_message_id)
         _tabla_atc_pendientes_borrar = []
 
-        async with aiohttp.ClientSession() as session:
-            # Antes esto no chequeaba el resultado del delete — si Discord
-            # devolvía un error (ej. 429 por rate limit, muy probable acá
-            # porque se repostea en CADA mensaje del canal), el mensaje viejo
-            # quedaba sin borrar y el nuevo se publicaba igual, dejando dos
-            # tablas visibles a la vez. Ahora, si falla, se reintenta en el
-            # próximo repost en vez de abandonarlo.
-            for msg_id in a_borrar:
-                try:
-                    async with session.delete(
-                        f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{msg_id}",
-                        headers=headers,
-                    ) as resp_del:
-                        if resp_del.status not in (204, 404):
-                            detalle = await resp_del.text()
-                            print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {resp_del.status} {detalle}")
-                            _tabla_atc_pendientes_borrar.append(msg_id)
-                except Exception as err:
-                    print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {err}")
+        # Antes esto no chequeaba el resultado del delete — si Discord
+        # devolvía un error (ej. 429 por rate limit, muy probable acá porque
+        # se repostea en CADA mensaje del canal), el mensaje viejo quedaba
+        # sin borrar y el nuevo se publicaba igual, dejando dos tablas
+        # visibles a la vez. Ahora, si falla, se reintenta en el próximo
+        # repost en vez de abandonarlo — y _discord_request ya se encarga de
+        # respetar Retry-After en vez de seguir de largo pegándole a Discord.
+        for msg_id in a_borrar:
+            try:
+                status, data_del, texto = await _discord_request(
+                    "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{msg_id}",
+                    headers=headers,
+                )
+                if status not in (204, 404):
+                    print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {status} {texto or data_del}")
                     _tabla_atc_pendientes_borrar.append(msg_id)
+            except DiscordPausado as err:
+                print(f"Aviso: freno de mano activo, no borro la tabla ATC vieja ({msg_id}) por ahora: {err}")
+                _tabla_atc_pendientes_borrar.append(msg_id)
+            except Exception as err:
+                print(f"Aviso: no pude borrar la tabla ATC vieja ({msg_id}): {err}")
+                _tabla_atc_pendientes_borrar.append(msg_id)
 
-            async with session.post(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
-                headers=headers, json=payload,
-            ) as resp:
-                if resp.status >= 300:
-                    detalle = await resp.text()
-                    raise RuntimeError(f"Discord respondió {resp.status}: {detalle}")
-                data = await resp.json()
-                _tabla_atc_message_id = data["id"]
+        status, data, texto = await _discord_request(
+            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
+            headers=headers, json_body=payload,
+        )
+        if status >= 300:
+            raise RuntimeError(f"Discord respondió {status}: {texto or data}")
+        _tabla_atc_message_id = data["id"]
 
 
 async def _evento_tabla_atc(request):
@@ -2226,11 +2320,10 @@ async def _procesar_voto_control(interaction: discord.Interaction, voto: str):
     headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
     payload = _construir_payload_encuesta_control(len(registro["si"]), len(registro["no"]))
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.patch(
-                f"https://discord.com/api/v10/channels/{interaction.channel_id}/messages/{msg_id}",
-                headers=headers, json=payload,
-            )
+        await _discord_request(
+            "PATCH", f"https://discord.com/api/v10/channels/{interaction.channel_id}/messages/{msg_id}",
+            headers=headers, json_body=payload,
+        )
     except Exception as err:
         print(f"ERROR al actualizar encuesta de control: {err}")
 
