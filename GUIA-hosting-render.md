@@ -90,3 +90,19 @@ Render detecta el push automáticamente y vuelve a desplegar solo — no necesit
 
 - Es normal ver alguna reconexión breve de vez en cuando (el plan gratis no es tan estable como uno pagado), pero el bot se recupera solo.
 - Si más adelante quieres más estabilidad, Render tiene un plan pagado (~$7/mes) que elimina el dormido.
+
+## ⚠️ Disco persistente (IMPORTANTE desde que el bot tiene su propia base de datos)
+
+Desde el rediseño del bot (vuelos, ATC, moderación, Academia — todo con motor
+propio en `data/atc24.db`, SQLite), **el disco free de Render es efímero**:
+cada vez que Render redespliega el servicio (un push nuevo, o un reinicio del
+plan free), el archivo `data/atc24.db` se borra y el bot arranca con la base
+vacía — se pierden vuelos activos, casos de moderación, progreso de Academia,
+todo.
+
+Para que los datos sobrevivan a un redeploy, hay que agregar un **Persistent
+Disk** al servicio en Render (Settings → Disks → Add Disk), montado en la
+carpeta `data/` de este repo, con al menos 1 GB (de sobra para SQLite). Esto
+es un servicio pago aparte del Web Service gratis — revisa el precio actual
+en Render antes de activarlo. Sin este disco, tratá al bot como si perdiera
+memoria en cada actualización.

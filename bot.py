@@ -85,6 +85,10 @@ from discord import app_commands
 from aiohttp import web
 
 from welcome_card import generar_tarjeta_bienvenida
+import atc_core
+import moderation_core
+import academy_core
+import sessions_core
 
 CARPETA_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 
@@ -108,12 +112,6 @@ PORT = int(os.environ.get("PORT", "10000"))  # Render inyecta PORT automáticame
 # en propagarse la primera vez.
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 
-# Para que /ascender pueda consultar Academia en la web (repo ATC24Espanol,
-# separado de este). BOT_SHARED_SECRET debe ser EXACTAMENTE igual al que
-# está en el .env de la web (variable del mismo nombre).
-WEB_API_BASE = os.environ.get("WEB_API_BASE", "https://atc24espanol.lat")
-BOT_SHARED_SECRET = os.environ.get("BOT_SHARED_SECRET")
-
 # API key de Bloxlink (dashboard de Bloxlink → tu servidor → API). Se usa
 # para leer el nombre REAL de Roblox ya verificado y usarlo como base del
 # apodo, en vez del username de Discord. Si no está configurada, el apodo
@@ -121,12 +119,16 @@ BOT_SHARED_SECRET = os.environ.get("BOT_SHARED_SECRET")
 BLOXLINK_API_KEY = os.environ.get("BLOXLINK_API_KEY")
 
 # Canal de Discord donde el bot publica/edita los mensajes de plan de vuelo
-# (Components V2 + nombre real de Roblox vía Bloxlink) — la web le avisa a
-# este bot en vez de mandar un webhook. ID de canal, no de webhook.
+# (Components V2 + nombre real de Roblox vía Bloxlink) — /vuelo publica acá
+# directo, motor propio (atc_core), sin depender de la web. ID de canal.
 DISCORD_CHANNEL_FLIGHTS = os.environ.get("DISCORD_CHANNEL_FLIGHTS")
 # Mismo patrón para anuncios de posición ATC abierta y para el ATIS.
 DISCORD_CHANNEL_ATC = os.environ.get("DISCORD_CHANNEL_ATC")
 DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS")
+# Canal donde vive el panel de "Sesiones agendadas" de Academia y se publican
+# las sesiones en vivo (Fase C, sistema de sesiones). Opcional — si no está
+# configurado, /academia-agendar sigue guardando la sesión pero no hay panel.
+DISCORD_CHANNEL_ACADEMIA_SESIONES = os.environ.get("DISCORD_CHANNEL_ACADEMIA_SESIONES")
 
 # ─── Sistema de tickets de soporte ─────────────────────────────────────────
 # Rol que puede ver/gestionar TODOS los tickets, además de Liderazgo. Opcional
@@ -165,6 +167,25 @@ BRAND_RUNWAY_WHITE = 0xF5F7FA
 # garantiza persistencia entre despliegues.
 CARPETA_DATOS = os.path.join(CARPETA_SCRIPT, "data")
 os.makedirs(CARPETA_DATOS, exist_ok=True)
+
+# ─── Motor de datos propio del bot (Fase A del rediseño) — SQLite embebida,
+# reemplaza la dependencia de la web para vuelos y posiciones ATC. OJO: en
+# Render el disco es efímero salvo que se agregue un "persistent disk" al
+# servicio — sin eso, esta base se reinicia vacía en cada redeploy.
+ATC_DB_PATH = os.path.join(CARPETA_DATOS, "atc24.db")
+db: "aiosqlite.Connection" = None  # se asigna en setup_hook
+
+# Cuánto tiempo puede quedar un canal de voz de posición ATC vacío antes de
+# que el bot cierre la posición solo — reemplaza el viejo mecanismo (roto)
+# de la web, que dependía de que el socket del navegador siguiera "trackeando"
+# la posición. Acá la señal es la MEJOR posible en Discord: si no hay nadie
+# en el canal de voz de la posición, no se está controlando de verdad.
+ATC_VACIO_GRACIA_SEG = 10 * 60  # 10 minutos
+
+# Cada cuánto se revisan vuelos activos abandonados (el piloto nunca marcó
+# su plan como completado/cancelado) para expirarlos y que no queden
+# contando para siempre en /servidor y el dashboard.
+VUELO_EXPIRA_HORAS = 8
 
 
 def _leer_json(nombre: str, default: dict) -> dict:
@@ -474,6 +495,18 @@ def has_any_role(member: discord.Member, role_ids: list) -> bool:
     return any(rid in ids for rid in role_ids)
 
 
+# ─── Permisos de moderación centralizados (Fase B) — antes cada comando
+# repetía su propia lista de roles inline; ahora hay un solo lugar que
+# decide quién puede advertir/silenciar (staff normal) vs. quién puede
+# expulsar/banear (solo Liderazgo, acciones más graves e irreversibles).
+def es_staff_moderacion(member: discord.Member) -> bool:
+    return has_any_role(member, LIDERAZGO_ORDER + INSTRUCTOR_ORDER)
+
+
+def es_staff_senior(member: discord.Member) -> bool:
+    return has_any_role(member, LIDERAZGO_ORDER)
+
+
 def _categoria_de_rol(role_id: int):
     if role_id in LIDERAZGO_ORDER:
         return "LIDERAZGO"
@@ -514,38 +547,6 @@ def _puede_ascender_alguna(invocador: discord.Member) -> bool:
     return any(rid in ids for rid in INSTRUCTOR_ORDER)
 
 
-async def _consulta_web(ruta: str, params: dict = None) -> dict:
-    """GET genérico contra la API de la web, autenticado con BOT_SHARED_SECRET.
-    Lanza RuntimeError con un mensaje legible si algo sale mal."""
-    if not BOT_SHARED_SECRET:
-        raise RuntimeError("BOT_SHARED_SECRET no está configurado en el bot")
-    url = f"{WEB_API_BASE}{ruta}"
-    headers = {"x-bot-secret": BOT_SHARED_SECRET}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params or {}) as resp:
-            if resp.status != 200:
-                detalle = await resp.text()
-                raise RuntimeError(f"la web respondió {resp.status}: {detalle}")
-            return await resp.json()
-
-
-async def _consulta_web_post(ruta: str, body: dict) -> dict:
-    """POST genérico contra la API de la web, autenticado con BOT_SHARED_SECRET.
-    Lanza RuntimeError con el status HTTP incluido en el mensaje (para poder
-    distinguir casos como 409 en el llamador)."""
-    if not BOT_SHARED_SECRET:
-        raise RuntimeError("BOT_SHARED_SECRET no está configurado en el bot")
-    url = f"{WEB_API_BASE}{ruta}"
-    headers = {"x-bot-secret": BOT_SHARED_SECRET, "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=body) as resp:
-            if resp.status >= 300:
-                detalle = await resp.text()
-                if resp.status == 404:
-                    raise RuntimeError("404: primero tienes que iniciar sesión en la web al menos una vez")
-                raise RuntimeError(f"{resp.status}: {detalle}")
-            return await resp.json()
-
 
 BRANCH_LABEL = {"atc": "🛫 ATC", "pilot": "✈️ Piloto"}
 BRANCH_ORDER = ["atc", "pilot"]
@@ -575,10 +576,8 @@ def _agrupar_por_rama(items: list, campo_rama: str = "branch") -> dict:
 
 
 async def _certificado_en_rama(discord_id: str, branch: str) -> bool:
-    """Consulta la web (repo ATC24Espanol) para saber si el usuario tiene
-    certificado (teoría + examen final) en esa rama de Academia."""
-    data = await _consulta_web(f"/api/bot/academy-status/{discord_id}", {"branch": branch})
-    return bool(data.get("certified"))
+    """Motor propio de Academia (Fase C) — antes le pegaba a la web."""
+    return await academy_core.has_final_certificate(db, str(discord_id), branch)
 
 
 # Todas las categorías ascendibles por comando (Liderazgo/Instructor incluidos,
@@ -620,12 +619,12 @@ async def actualizar_apodo(member: discord.Member):
     return objetivo, True
 
 
-async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama: str, ruta_academia: str):
+async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama: str, branch: str):
     """Elegir rama en el mensaje de bienvenida verifica al usuario (V, se
-    saca NV) y lo manda a inscribirse en Academia — NO le da FLT ni ATC acá:
-    esos roles base solo se otorgan cuando tiene un rating real (ver
-    enforce_base_tags), y el rol de estudiante (ATO/APA) lo otorga la propia
-    web al completar la inscripción en Academia."""
+    saca NV) y lo inscribe en Academia (motor propio del bot, Fase C) — NO le
+    da FLT ni ATC acá: esos roles base solo se otorgan cuando tiene un rating
+    real (ver enforce_base_tags); el rol de estudiante lo otorga un
+    instructor al aprobar la inscripción (/panel-moderacion / cola de Academia)."""
     # El botón se manda por DM, así que interaction.guild siempre es None acá
     # (los DM no tienen servidor asociado) — hay que buscar el servidor real
     # por ID en vez de asumir que la interacción trae uno.
@@ -660,11 +659,18 @@ async def _asignar_rol_bienvenida(interaction: discord.Interaction, nombre_rama:
         return
 
     saludo = "¡Verificación confirmada! 🎉" if not ya_verificado else "Ya estabas verificado, todo en orden. ✈️"
-    mensaje = (
-        f"{saludo}\n"
-        f"Ahora entra a https://atc24espanol.lat/{ruta_academia} para inscribirte en Academia — {nombre_rama} — "
-        "y empezar tu formación real (examen de admisión, lecciones, evaluación final)."
-    )
+    existente = await academy_core.find_active_enrollment(db, str(interaction.user.id), branch)
+    if existente and existente["state"] == "pending":
+        mensaje = f"{saludo}\nYa tenés una inscripción pendiente en Academia — {nombre_rama}. Un instructor la va a revisar pronto."
+    elif existente and existente["state"] == "approved":
+        mensaje = f"{saludo}\nYa estás inscripto en Academia — {nombre_rama}. Usa `/academia` para ver tu progreso."
+    else:
+        await academy_core.request_enrollment(db, str(interaction.user.id), branch)
+        mensaje = (
+            f"{saludo}\n"
+            f"Te inscribí en Academia — {nombre_rama}. Un instructor va a revisar tu solicitud pronto "
+            "(lo ve en `/academia` → Cola de evaluaciones). Usa `/academia` para seguir tu progreso."
+        )
 
     # El botón ya vive dentro del DM, así que respondemos directo a la
     # interacción con el mensaje real (no hace falta mandar un DM aparte).
@@ -704,13 +710,11 @@ async def _ping(_request):
 
 
 async def iniciar_servidor_web():
-    """Levanta el mini servidor HTTP que Render necesita para no apagar el servicio."""
+    """Levanta el mini servidor HTTP que Render necesita para no apagar el
+    servicio. Desde la Fase E ya NO recibe webhooks de la web (ese canal se
+    cortó junto con server.js) — solo queda el keep-alive que usa UptimeRobot."""
     app = web.Application()
     app.router.add_get("/", _ping)
-    app.router.add_post("/discord/evento-vuelo", _evento_vuelo)
-    app.router.add_post("/discord/evento-atc", _evento_atc)
-    app.router.add_post("/discord/evento-atis", _evento_atis)
-    app.router.add_post("/discord/tabla-atc", _evento_tabla_atc)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -733,17 +737,16 @@ def _plural(n, singular, plural):
 async def _actualizar_presencia_loop():
     """Rota entre varios estados en vez de mostrar siempre el mismo texto fijo
     — sigue siendo texto simple (límite real de Discord para bots, ver charla
-    sobre rich presence de usuario), pero se siente más vivo. Usa los mismos
-    datos que ya devuelve /api/bot/live-counts (totalUsers/verifiedUsers
-    estaban disponibles pero no se usaban) para variar el contenido, no solo
-    el tipo de actividad."""
+    sobre rich presence de usuario), pero se siente más vivo. Desde la Fase A
+    los conteos salen del motor propio del bot (atc_core), ya no de la web —
+    esto además deja de depender de que atc24espanol.lat esté arriba."""
     indice = 0
     while True:
         try:
-            data = await _consulta_web("/api/bot/live-counts")
-            vuelos = data.get("activeFlights", 0)
-            controladores = data.get("activeControllers", 0)
-            verificados = data.get("verifiedUsers", 0)
+            vuelos = await atc_core.count_active_flights(db)
+            controladores = len(await atc_core.get_active_atc(db))
+            rol_v = client.guilds[0].get_role(V_ROLE_ID) if client.guilds else None
+            verificados = len(rol_v.members) if rol_v else 0
 
             variantes = [
                 (discord.ActivityType.watching,
@@ -852,23 +855,92 @@ async def _foto_semana_loop():
         await asyncio.sleep(1800)  # revisa cada 30 min
 
 
+_mantenimiento_atc_iniciado = False  # mismo motivo que los otros flags "_iniciada"
+_sesiones_academia_iniciado = False  # mismo motivo
+
+
+async def _reconciliar_atc_al_arrancar():
+    """Al reiniciar el proceso se pierden los timers de auto-cierre en
+    memoria (_atc_close_timers) — sin esto, una posición cuyo canal de voz
+    quedó vacío justo antes de un reinicio se quedaría abierta para siempre.
+    Recorre las posiciones activas y rearma el timer para las que ya están
+    vacías ahora mismo."""
+    if not GUILD_ID:
+        return
+    guild = client.get_guild(int(GUILD_ID))
+    if not guild:
+        return
+    for fila in await atc_core.get_active_atc(db):
+        voice_id = fila.get("voice_channel_id")
+        if not voice_id:
+            continue
+        canal = guild.get_channel(int(voice_id))
+        if canal is None:
+            # El canal ya no existe (se borró a mano) — cierra la posición.
+            cerrada = await atc_core.close_atc(db, fila["uuid"], reason="Canal de voz ya no existe")
+            if cerrada:
+                print(f"Posición ATC {cerrada['airport']}_{cerrada['position_type']} cerrada: su canal de voz ya no existía.")
+            continue
+        if not any(not m.bot for m in canal.members) and fila["uuid"] not in _atc_close_timers:
+            _atc_close_timers[fila["uuid"]] = client.loop.create_task(
+                _cerrar_atc_por_inactividad(fila["uuid"], voice_id)
+            )
+
+
+async def _mantenimiento_atc_loop():
+    """Expira vuelos que el piloto nunca cerró, para que no queden contando
+    para siempre en /servidor y en la tabla en vivo."""
+    while True:
+        await asyncio.sleep(1800)  # cada 30 min
+        try:
+            vencidos = await atc_core.expire_stale_flights(db, VUELO_EXPIRA_HORAS)
+            for fila in vencidos:
+                try:
+                    payload = _construir_payload_vuelo(_flight_row_to_op(fila), fila["owner_id"], "FlightExpired", None)
+                    await _enviar_o_editar_vuelo(fila["uuid"], payload)
+                except Exception as err:
+                    print(f"Aviso: no pude actualizar el mensaje del vuelo expirado {fila['uuid']}: {err}")
+        except Exception as err:
+            print(f"Aviso: fallo en el loop de mantenimiento ATC: {err}")
+
+
 @client.event
 async def on_ready():
     print(f"Conectado como {client.user} (id {client.user.id})")
     print("Esperando el comando !publicar-verificacion en algún canal…")
     print("El bot debe seguir corriendo para poder reaccionar a los clics del botón.\n")
 
-    global _presencia_iniciada, _foto_semana_iniciada
+    global _presencia_iniciada, _foto_semana_iniciada, _mantenimiento_atc_iniciado, _sesiones_academia_iniciado
     if not _presencia_iniciada:
         _presencia_iniciada = True
         client.loop.create_task(_actualizar_presencia_loop())
     if not _foto_semana_iniciada:
         _foto_semana_iniciada = True
         client.loop.create_task(_foto_semana_loop())
+    if not _mantenimiento_atc_iniciado:
+        _mantenimiento_atc_iniciado = True
+        await _reconciliar_atc_al_arrancar()
+        client.loop.create_task(_mantenimiento_atc_loop())
+    if not _sesiones_academia_iniciado:
+        _sesiones_academia_iniciado = True
+        client.loop.create_task(_sesiones_academia_loop())
 
 
 @client.event
 async def setup_hook():
+    global db
+    db = await atc_core.init_db(ATC_DB_PATH)
+    await moderation_core.init_schema(db)
+    await academy_core.init_schema(db)
+    await sessions_core.init_schema(db)
+    if not await academy_core.has_courses(db):
+        print(
+            "Aviso: la Academia todavía no tiene cursos cargados en la base propia del bot. "
+            "Corré `python migrar_academia.py <ruta a ATC24Espanol/data.db>` una vez para traer "
+            "el catálogo y el progreso de alumnos ya existentes."
+        )
+    print(f"Motor de datos propio (SQLite) listo en {ATC_DB_PATH}")
+
     # Se ejecuta antes de conectar a Discord — arrancamos el mini servidor
     # web aquí para que Render vea el puerto abierto cuanto antes.
     await iniciar_servidor_web()
@@ -1058,7 +1130,7 @@ async def _procesar_ascenso(interaction: discord.Interaction, miembro: discord.M
 #     await _procesar_ascenso(interaction, miembro, role_id)
 
 
-@tree.command(name="apodo", description="Actualiza tu apodo según tu rango y roles actuales")
+@tree.command(name="apodo", description="Recalcula y actualiza tu propio apodo según tu rango y roles actuales")
 async def apodo(interaction: discord.Interaction):
     member = interaction.user
     try:
@@ -1082,9 +1154,9 @@ async def apodo(interaction: discord.Interaction):
         await interaction.response.send_message(f"Tu apodo ya estaba correcto: **{nuevo}**.", ephemeral=True)
 
 
-@tree.command(name="apodo-miembro", description="Actualiza el apodo de otro miembro del servidor según su jerarquía de roles")
+@tree.command(name="apodo-miembro", description="Recalcula el apodo de otro miembro según su jerarquía de roles (Staff)")
 @app_commands.default_permissions()
-@app_commands.describe(miembro="Usuario a actualizar")
+@app_commands.describe(miembro="Miembro cuyo apodo se va a recalcular")
 async def apodo_miembro(interaction: discord.Interaction, miembro: discord.Member):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
         await interaction.response.send_message("Este comando es solo para Staff.", ephemeral=True)
@@ -1172,7 +1244,7 @@ async def apodo_borrar_todos(interaction: discord.Interaction):
 
 
 async def _embed_progreso(usuario) -> discord.Embed:
-    data = await _consulta_web(f"/api/bot/user-progress/{usuario.id}")
+    data = await academy_core.user_state(db, str(usuario.id))
     embed = discord.Embed(title="Tu progreso en Academia", color=BRAND_RADAR_GREEN)
 
     if not data.get("enrollments"):
@@ -1207,10 +1279,13 @@ async def _embed_progreso(usuario) -> discord.Embed:
     return embed
 
 
+def _fecha_ms(ms: int) -> str:
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc).strftime("%d/%m/%Y")
+
+
 async def _embed_certificados(objetivo):
     """Devuelve (embed, texto_si_vacio) — solo uno de los dos viene con valor."""
-    data = await _consulta_web(f"/api/bot/certificates/{objetivo.id}")
-    items = data.get("items", [])
+    items = (await academy_core.user_state(db, str(objetivo.id)))["certificates"]
     if not items:
         return None, f"{objetivo.mention} todavía no tiene certificados en Academia."
 
@@ -1221,29 +1296,134 @@ async def _embed_certificados(objetivo):
         certs = por_rama.get(rama, [])
         if not certs:
             continue
-        texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']} ({c['issuedAt']})" for c in certs)
+        texto = "\n".join(f"{CERT_TYPE_LABEL.get(c['type'], c['type'])} — {c['courseTitle']} ({_fecha_ms(c['issuedAt'])})" for c in certs)
         embed.add_field(name=BRANCH_LABEL[rama], value=texto, inline=False)
     return embed, None
 
 
 async def _embed_cola(rama_valor=None):
-    data = await _consulta_web("/api/bot/pending-evaluations", {"branch": rama_valor} if rama_valor else None)
-    items = data.get("items", [])
-    if not items:
-        return None, f"{E['check']} No hay evaluaciones pendientes ahora mismo."
+    """Devuelve (embed, texto_si_vacio, evaluaciones, inscripciones) — junta
+    la cola de evaluaciones de curso CON la cola de inscripciones nuevas
+    (antes eran dos pantallas separadas en la web; acá comparten un solo
+    panel con dos selects para aprobar/rechazar)."""
+    evaluaciones = await academy_core.pending_evaluations(db, rama_valor)
+    inscripciones = await academy_core.pending_enrollments(db, rama_valor)
+    if not evaluaciones and not inscripciones:
+        return None, f"{E['check']} No hay nada pendiente de revisar ahora mismo.", [], []
 
-    por_rama = _agrupar_por_rama(items)
-    embed = discord.Embed(title="Evaluaciones pendientes de revisar", description=E["chat"], color=BRAND_BEACON_AMBER)
-    for r in BRANCH_ORDER:
-        pendientes = por_rama.get(r, [])
-        if not pendientes:
-            continue
-        texto = "\n".join(
-            f"• **{it['username']}** — {it['courseTitle']} ({EVAL_STATE_LABEL.get(it['evalState'], it['evalState'])})"
-            for it in pendientes
+    embed = discord.Embed(title="Cola de Academia", description=E["chat"], color=BRAND_BEACON_AMBER)
+    if inscripciones:
+        por_rama = _agrupar_por_rama(inscripciones)
+        for r in BRANCH_ORDER:
+            pendientes = por_rama.get(r, [])
+            if not pendientes:
+                continue
+            texto = "\n".join(f"• <@{it['user_id']}>" for it in pendientes)
+            embed.add_field(name=f"{BRANCH_LABEL[r]} · Inscripciones nuevas", value=texto, inline=False)
+    if evaluaciones:
+        por_rama = _agrupar_por_rama(evaluaciones)
+        for r in BRANCH_ORDER:
+            pendientes = por_rama.get(r, [])
+            if not pendientes:
+                continue
+            texto = "\n".join(
+                f"• <@{it['userId']}> — {it['courseTitle']} ({EVAL_STATE_LABEL.get(it['evalState'], it['evalState'])})"
+                for it in pendientes
+            )
+            embed.add_field(name=f"{BRANCH_LABEL[r]} · Evaluaciones", value=texto, inline=False)
+    return embed, None, evaluaciones, inscripciones
+
+
+class InscripcionAccionView(discord.ui.View):
+    def __init__(self, enrollment_uuid: str):
+        super().__init__(timeout=180)
+        self.enrollment_uuid = enrollment_uuid
+
+    @discord.ui.button(label="Aprobar", style=discord.ButtonStyle.success, emoji="✅")
+    async def aprobar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fila = await academy_core.resolve_enrollment(db, self.enrollment_uuid, True, str(interaction.user.id))
+        if not fila:
+            await interaction.response.send_message("Esa inscripción ya no está pendiente.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Inscripción aprobada para <@{fila['user_id']}>. ✅", ephemeral=True)
+
+    @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fila = await academy_core.resolve_enrollment(db, self.enrollment_uuid, False, str(interaction.user.id))
+        if not fila:
+            await interaction.response.send_message("Esa inscripción ya no está pendiente.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Inscripción rechazada para <@{fila['user_id']}>.", ephemeral=True)
+
+
+class InscripcionesSelect(discord.ui.Select):
+    def __init__(self, items: list):
+        opciones = [
+            discord.SelectOption(
+                label=f"{BRANCH_LABEL.get(it['branch'], it['branch'])} — {it['user_id']}"[:100],
+                value=it["uuid"],
+            )
+            for it in items[:25]
+        ]
+        super().__init__(placeholder="Aprobar/rechazar una inscripción nueva…", options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "¿Qué querés hacer con esta inscripción?", view=InscripcionAccionView(self.values[0]), ephemeral=True,
         )
-        embed.add_field(name=BRANCH_LABEL[r], value=texto, inline=False)
-    return embed, None
+
+
+class EvaluacionAccionView(discord.ui.View):
+    def __init__(self, user_id: str, course_uuid: str):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.course_uuid = course_uuid
+
+    @discord.ui.button(label="Aprobar", style=discord.ButtonStyle.success, emoji="✅")
+    async def aprobar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resultado = await academy_core.resolve_evaluation(db, self.user_id, self.course_uuid, True, str(interaction.user.id))
+        if not resultado:
+            await interaction.response.send_message("Esa evaluación ya no está pendiente.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Aprobado: <@{self.user_id}> — {resultado.get('courseTitle') or 'curso'}. ✅", ephemeral=True,
+        )
+
+    @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resultado = await academy_core.resolve_evaluation(db, self.user_id, self.course_uuid, False, str(interaction.user.id))
+        if not resultado:
+            await interaction.response.send_message("Esa evaluación ya no está pendiente.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Rechazado: <@{self.user_id}>. Puede volver a intentarlo.", ephemeral=True)
+
+
+class EvaluacionesSelect(discord.ui.Select):
+    def __init__(self, items: list):
+        opciones = [
+            discord.SelectOption(
+                label=it["courseTitle"][:100], description=f"Alumno {it['userId']}"[:100],
+                value=f"{it['userId']}|{it['courseUuid']}",
+            )
+            for it in items[:25]
+        ]
+        super().__init__(placeholder="Aprobar/rechazar una evaluación…", options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id, course_uuid = self.values[0].split("|", 1)
+        await interaction.response.send_message(
+            f"¿Qué querés hacer con la evaluación de <@{user_id}>?",
+            view=EvaluacionAccionView(user_id, course_uuid), ephemeral=True,
+        )
+
+
+class ColaAcademiaView(discord.ui.View):
+    def __init__(self, evaluaciones: list, inscripciones: list):
+        super().__init__(timeout=180)
+        if inscripciones:
+            self.add_item(InscripcionesSelect(inscripciones))
+        if evaluaciones:
+            self.add_item(EvaluacionesSelect(evaluaciones))
 
 
 class AscenderRangoSelect(discord.ui.Select):
@@ -1308,16 +1488,17 @@ class AcademiaView(discord.ui.View):
 
     @discord.ui.button(label="Cola de evaluaciones", style=discord.ButtonStyle.secondary, emoji="📋")
     async def cola_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+        if not es_staff_moderacion(interaction.user):
             await interaction.response.send_message("Esta opción es solo para Instructores/Staff.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            embed, texto = await _embed_cola()
+            embed, texto, evaluaciones, inscripciones = await _embed_cola()
         except Exception as err:
             await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
             return
-        await interaction.followup.send(embed=embed, content=texto, ephemeral=True)
+        vista = ColaAcademiaView(evaluaciones, inscripciones) if (evaluaciones or inscripciones) else None
+        await interaction.followup.send(embed=embed, content=texto, view=vista, ephemeral=True)
 
     @discord.ui.button(label="Ascender", style=discord.ButtonStyle.danger)
     async def ascender_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1329,7 +1510,7 @@ class AcademiaView(discord.ui.View):
         )
 
 
-@tree.command(name="academia", description="Consulta tu progreso, certificados, cola de evaluaciones y ascensos en Academia")
+@tree.command(name="academia", description="Abre tu panel de Academia: progreso, certificados, cola de evaluaciones y ascensos")
 async def academia(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Elige qué quieres ver:", view=AcademiaView(interaction.user), ephemeral=True,
@@ -1359,14 +1540,27 @@ class EcoModal(discord.ui.Modal, title="Mandar mensaje"):
             )
             return
         await interaction.response.send_message(f"Mensaje enviado a {self.destino.mention}. ✅", ephemeral=True)
-        print(f"{interaction.user} usó /eco hacia {self.destino}")
+        print(f"{interaction.user} usó /anunciar hacia {self.destino}")
 
 
-@tree.command(name="vuelo", description="Presenta un plan de vuelo (queda sincronizado con la web, no editable desde Discord)")
+def _flight_row_to_op(row: dict) -> dict:
+    """Adapta las columnas de la tabla `flights` al shape camelCase que ya
+    espera _construir_payload_vuelo (heredado del formato de la web)."""
+    return {
+        "callsign": row["callsign"], "aircraftType": row["aircraft_type"],
+        "flightRules": row["flight_rules"], "departure": row["departure"],
+        "destination": row["destination"], "route": row["route"],
+        "level": row["level"], "alternate": row["alternate"],
+    }
+
+
+@tree.command(name="vuelo", description="Presenta un plan de vuelo y lo publica en el canal de vuelos")
 @app_commands.describe(
-    callsign="Callsign", aircraft="Tipo de aeronave", salida="ICAO de salida", llegada="ICAO de llegada",
-    nivel="Nivel de vuelo (ej. FL350)", reglas="Reglas de vuelo",
-    ruta="Ruta (opcional)", alterno="Aeródromo alterno (opcional)", observaciones="Observaciones (opcional)",
+    callsign="Callsign de tu aeronave (ej. AEA1234)", aircraft="Tipo de aeronave (ej. A320, B738)",
+    salida="ICAO del aeródromo de salida (ej. SBGR)", llegada="ICAO del aeródromo de llegada (ej. SBSP)",
+    nivel="Nivel de vuelo (ej. FL350)", reglas="Reglas de vuelo (IFR o VFR)",
+    ruta="Ruta de vuelo, si aplica (opcional)", alterno="Aeródromo alterno (opcional)",
+    observaciones="Cualquier información adicional para control (opcional)",
 )
 @app_commands.choices(reglas=[
     app_commands.Choice(name="IFR", value="IFR"),
@@ -1379,22 +1573,184 @@ async def vuelo(
     ruta: str = None, alterno: str = None, observaciones: str = None,
 ):
     await interaction.response.defer(ephemeral=True)
-    body = {
-        "discordId": str(interaction.user.id), "callsign": callsign, "aircraftType": aircraft,
-        "departure": salida.upper(), "destination": llegada.upper(), "level": nivel,
-        "flightRules": reglas.value if reglas else "IFR",
-        "route": ruta or "", "alternate": alterno or "", "remarks": observaciones or "",
-    }
+    fila = await atc_core.create_flight(
+        db, owner_id=str(interaction.user.id), callsign=callsign, aircraft_type=aircraft,
+        departure=salida.upper(), destination=llegada.upper(), level=nivel,
+        flight_rules=(reglas.value if reglas else "IFR"),
+        route=ruta or "", alternate=alterno or "", remarks=observaciones or "",
+    )
     try:
-        await _consulta_web_post("/api/bot/flights", body)
+        roblox_name = await _roblox_username(interaction.user.id)
+    except Exception:
+        roblox_name = None
+    payload = _construir_payload_vuelo(_flight_row_to_op(fila), str(interaction.user.id), "FlightCreated", roblox_name)
+    try:
+        await _enviar_o_editar_vuelo(fila["uuid"], payload)
     except Exception as err:
-        await interaction.followup.send(f"No pude presentar el plan de vuelo: {err}", ephemeral=True)
+        print(f"ERROR al publicar plan de vuelo: {err}")
+    await interaction.followup.send(
+        f"Plan de vuelo **{callsign}** presentado. Usa `/vuelo-cerrar` cuando termines. ✅", ephemeral=True
+    )
+
+
+@tree.command(name="vuelo-cerrar", description="Marca tu plan de vuelo activo como completado (usa esto al aterrizar)")
+async def vuelo_cerrar(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    fila = await atc_core.latest_active_flight_for_owner(db, str(interaction.user.id))
+    if not fila:
+        await interaction.followup.send("No tienes ningún plan de vuelo activo.", ephemeral=True)
         return
-    await interaction.followup.send(f"Plan de vuelo **{callsign}** presentado. ✅", ephemeral=True)
+    fila = await atc_core.close_flight(db, fila["uuid"], atc_core.FLIGHT_COMPLETADO)
+    try:
+        payload = _construir_payload_vuelo(_flight_row_to_op(fila), str(interaction.user.id), "FlightCompleted", None)
+        await _enviar_o_editar_vuelo(fila["uuid"], payload)
+    except Exception as err:
+        print(f"ERROR al actualizar mensaje de vuelo al cerrar: {err}")
+    await interaction.followup.send(f"Plan de vuelo **{fila['callsign']}** marcado como completado. ✅", ephemeral=True)
 
 
-@tree.command(name="atc", description="Abre una posición ATC (queda sincronizado con la web, no editable desde Discord)")
-@app_commands.describe(aeropuerto="ICAO del aeródromo", posicion="Posición a abrir", frecuencia="Frecuencia (ej. 118.200)")
+# ─── Posiciones ATC — motor propio (Fase A), canales de voz nativos ───────
+def _atc_row_to_op(row: dict) -> dict:
+    return {
+        "airport": row["airport"], "positionType": row["position_type"],
+        "frequency": row["frequency"], "ownerId": row["owner_id"],
+        "controllerName": row["controller_name"],
+    }
+
+
+async def _activos_para_tabla() -> list:
+    filas = await atc_core.get_active_atc(db)
+    return [_atc_row_to_op(f) for f in filas]
+
+
+async def _crear_canal_atc(fila: dict) -> tuple[str | None, str | None]:
+    """Crea (o reutiliza) la categoría del aeródromo y el canal de voz de esta
+    posición usando la API nativa de discord.py — reemplaza los llamados HTTP
+    crudos que antes hacía discordVoiceChannels.js (repo web)."""
+    if not GUILD_ID:
+        return None, None
+    guild = client.get_guild(int(GUILD_ID))
+    if not guild:
+        return None, None
+    icao = fila["airport"]
+    categoria = None
+    category_id = await atc_core.get_category(db, icao)
+    if category_id:
+        categoria = guild.get_channel(int(category_id))
+    if categoria is None:
+        categoria = discord.utils.get(guild.categories, name=icao)
+    if categoria is None:
+        try:
+            categoria = await guild.create_category(icao, reason="Nuevo aeródromo con control activo")
+        except discord.Forbidden:
+            print(f"Aviso: sin permiso para crear la categoría de voz de {icao}")
+            return None, None
+        try:
+            await guild.create_voice_channel(atc_core.UNICOM_NAME, category=categoria, reason="Canal UNICOM fijo")
+        except discord.Forbidden:
+            print(f"Aviso: sin permiso para crear el canal UNICOM de {icao}")
+    await atc_core.save_category(db, icao, str(categoria.id))
+    nombre = f"{icao}_{fila['position_type']} | {fila['frequency']}"
+    try:
+        canal = await guild.create_voice_channel(nombre, category=categoria, reason="Nueva posición ATC abierta")
+    except discord.Forbidden:
+        print(f"Aviso: sin permiso para crear el canal de voz {nombre}")
+        return str(categoria.id), None
+    return str(categoria.id), str(canal.id)
+
+
+async def _borrar_canal_atc(fila: dict) -> None:
+    if not GUILD_ID:
+        return
+    guild = client.get_guild(int(GUILD_ID))
+    if not guild:
+        return
+    voice_id = fila.get("voice_channel_id")
+    if voice_id:
+        canal = guild.get_channel(int(voice_id))
+        if canal:
+            try:
+                await canal.delete(reason="Posición ATC cerrada")
+            except (discord.Forbidden, discord.NotFound):
+                pass
+    icao = fila["airport"]
+    if await atc_core.count_active_atc(db, icao) > 0:
+        return  # sigue habiendo otra posición activa en este aeródromo
+    category_id = await atc_core.get_category(db, icao)
+    if not category_id:
+        return
+    categoria = guild.get_channel(int(category_id))
+    if categoria:
+        for canal in list(categoria.channels):
+            try:
+                await canal.delete(reason="Aeródromo sin controladores activos")
+            except (discord.Forbidden, discord.NotFound):
+                pass
+        try:
+            await categoria.delete(reason="Aeródromo sin controladores activos")
+        except (discord.Forbidden, discord.NotFound):
+            pass
+    await atc_core.clear_category(db, icao)
+
+
+# uuid de posición ATC -> Task que la cerrará sola si el canal sigue vacío
+_atc_close_timers: dict = {}
+
+
+def _cancelar_timer_cierre_atc(op_uuid: str) -> None:
+    tarea = _atc_close_timers.pop(op_uuid, None)
+    if tarea and not tarea.done():
+        tarea.cancel()
+
+
+async def _cerrar_atc_por_inactividad(op_uuid: str, voice_channel_id: str) -> None:
+    """Reemplaza el viejo mecanismo de auto-cierre por desconexión de socket
+    del navegador (la causa del bug de canales borrados en plena frecuencia).
+    Acá la señal es la presencia real en el canal de voz de la posición: si
+    después del margen de gracia sigue sin nadie, recién ahí se cierra."""
+    try:
+        await asyncio.sleep(ATC_VACIO_GRACIA_SEG)
+    except asyncio.CancelledError:
+        return
+    guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
+    canal = guild.get_channel(int(voice_channel_id)) if guild else None
+    if canal and any(not m.bot for m in canal.members):
+        return  # alguien volvió a entrar mientras esperábamos
+    fila = await atc_core.close_atc(db, op_uuid, reason="Cierre automático: canal de voz vacío")
+    if not fila:
+        return
+    await _borrar_canal_atc(fila)
+    try:
+        await _repostear_tabla_atc(await _activos_para_tabla())
+    except Exception as err:
+        print(f"ERROR al actualizar la tabla ATC tras un cierre automático: {err}")
+    print(f"Posición ATC {fila['airport']}_{fila['position_type']} cerrada sola por inactividad (canal de voz vacío).")
+    _atc_close_timers.pop(op_uuid, None)
+
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if before.channel == after.channel:
+        return
+    for canal in filter(None, {before.channel, after.channel}):
+        fila = await atc_core.get_atc_by_voice_channel(db, str(canal.id))
+        if not fila:
+            continue
+        vacio = not any(not m.bot for m in canal.members)
+        if vacio:
+            if fila["uuid"] not in _atc_close_timers:
+                _atc_close_timers[fila["uuid"]] = client.loop.create_task(
+                    _cerrar_atc_por_inactividad(fila["uuid"], str(canal.id))
+                )
+        else:
+            _cancelar_timer_cierre_atc(fila["uuid"])
+
+
+@tree.command(name="atc", description="Abre una posición de control ATC y crea su canal de voz")
+@app_commands.describe(
+    aeropuerto="ICAO del aeródromo a controlar (ej. SBGR)", posicion="Posición que vas a abrir",
+    frecuencia="Frecuencia de radio (ej. 118.200)",
+)
 @app_commands.choices(posicion=[
     app_commands.Choice(name="Delivery", value="DEL"),
     app_commands.Choice(name="Suelo", value="GND"),
@@ -1407,124 +1763,320 @@ async def atc(interaction: discord.Interaction, aeropuerto: str, posicion: app_c
         await interaction.response.send_message("Este comando es solo para controladores (rol ATC).", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    body = {
-        "discordId": str(interaction.user.id), "airport": aeropuerto.upper(),
-        "positionType": posicion.value, "frequency": frecuencia,
-    }
+    icao = aeropuerto.upper()
     try:
-        data = await _consulta_web_post("/api/bot/atc", body)
-    except Exception as err:
-        mensaje = str(err)
-        if "409" in mensaje:
-            await interaction.followup.send(f"Ya hay alguien controlando {aeropuerto.upper()}_{posicion.value}.", ephemeral=True)
-        else:
-            await interaction.followup.send(f"No pude abrir la posición: {err}", ephemeral=True)
+        fila = await atc_core.open_atc(
+            db, owner_id=str(interaction.user.id), controller_name=interaction.user.display_name,
+            airport=icao, position_type=posicion.value, frequency=frecuencia,
+        )
+    except atc_core.PositionAlreadyOpen:
+        await interaction.followup.send(f"Ya hay alguien controlando {icao}_{posicion.value}.", ephemeral=True)
         return
-    await interaction.followup.send(f"Posición **{aeropuerto.upper()}_{posicion.value}** abierta en {frecuencia}. ✅", ephemeral=True)
+
+    category_id, voice_id = await _crear_canal_atc(fila)
+    if category_id or voice_id:
+        await atc_core.set_atc_channel(db, fila["uuid"], category_id, voice_id)
+
+    try:
+        payload = _construir_payload_atc_abierto(_atc_row_to_op(fila), str(interaction.user.id))
+        if DISCORD_CHANNEL_ATC:
+            await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATC), payload)
+    except Exception as err:
+        print(f"ERROR al anunciar apertura de posición ATC: {err}")
+    try:
+        await _repostear_tabla_atc(await _activos_para_tabla())
+    except Exception as err:
+        print(f"ERROR al actualizar la tabla ATC tras abrir posición: {err}")
+
+    canal_txt = f" — canal de voz: <#{voice_id}>" if voice_id else ""
+    await interaction.followup.send(
+        f"Posición **{icao}_{posicion.value}** abierta en {frecuencia}.{canal_txt} "
+        f"Usa `/atc-cerrar` cuando termines (o se cierra sola si el canal de voz queda vacío {ATC_VACIO_GRACIA_SEG // 60} min). ✅",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="atc-cerrar", description="Cierra tu posición ATC y borra su canal de voz")
+async def atc_cerrar(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    fila = await atc_core.close_atc_by_owner(db, str(interaction.user.id), reason="Cierre manual del controlador")
+    if not fila:
+        await interaction.followup.send("No tienes ninguna posición ATC abierta.", ephemeral=True)
+        return
+    _cancelar_timer_cierre_atc(fila["uuid"])
+    await _borrar_canal_atc(fila)
+    try:
+        await _repostear_tabla_atc(await _activos_para_tabla())
+    except Exception as err:
+        print(f"ERROR al actualizar la tabla ATC tras cerrar posición: {err}")
+    await interaction.followup.send(
+        f"Posición **{fila['airport']}_{fila['position_type']}** cerrada. ✅", ephemeral=True
+    )
+
+
+@tree.command(name="rankings", description="Muestra el top 10 de pilotos y controladores más activos de la red")
+async def rankings(interaction: discord.Interaction):
+    await interaction.response.defer()
+    pilotos = await atc_core.top_pilots(db, limit=10)
+    controladores = await atc_core.top_controllers(db, limit=10)
+    embed = discord.Embed(title="Rankings de ATC24 Español", description=E["brujula"], color=BRAND_BEACON_AMBER)
+    if pilotos:
+        texto = "\n".join(f"**{i+1}.** <@{p['owner_id']}> — {p['total']} vuelo(s)" for i, p in enumerate(pilotos))
+        embed.add_field(name="Top pilotos", value=texto, inline=False)
+    else:
+        embed.add_field(name="Top pilotos", value="Todavía no hay vuelos completados.", inline=False)
+    if controladores:
+        texto = "\n".join(f"**{i+1}.** <@{c['owner_id']}> — {c['total']} posición(es)" for i, c in enumerate(controladores))
+        embed.add_field(name="Top controladores", value=texto, inline=False)
+    else:
+        embed.add_field(name="Top controladores", value="Todavía no hay posiciones ATC cerradas.", inline=False)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="servidor", description="Muestra el estado en vivo de la red: vuelos, controladores y verificados")
 async def servidor(interaction: discord.Interaction):
     await interaction.response.defer()
-    try:
-        data = await _consulta_web("/api/bot/live-counts")
-    except Exception as err:
-        await interaction.followup.send(f"No pude consultar el estado del servidor: {err}")
-        return
+    vuelos = await atc_core.count_active_flights(db)
+    posiciones = await atc_core.get_active_atc(db)
+    verificados = totales = 0
+    if interaction.guild:
+        rol_v = interaction.guild.get_role(V_ROLE_ID)
+        verificados = len(rol_v.members) if rol_v else 0
+        totales = interaction.guild.member_count or 0
     embed = discord.Embed(title="Estado de ATC24 Español", description=E["antena"], color=BRAND_SKY_NAVY)
-    embed.add_field(name="Vuelos activos", value=str(data.get("activeFlights", 0)), inline=True)
-    embed.add_field(name="Controladores en línea", value=str(data.get("activeControllers", 0)), inline=True)
-    embed.add_field(name="Verificados", value=f"{data.get('verifiedUsers', 0)} / {data.get('totalUsers', 0)}", inline=True)
+    embed.add_field(name="Vuelos activos", value=str(vuelos), inline=True)
+    embed.add_field(name="Controladores en línea", value=str(len(posiciones)), inline=True)
+    embed.add_field(name="Verificados", value=f"{verificados} / {totales}", inline=True)
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="advertir", description="Da una advertencia formal a un usuario (queda registrada en la web)")
-@app_commands.default_permissions()
-@app_commands.describe(miembro="Usuario a advertir", motivo="Motivo de la advertencia")
-async def advertir(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
-    if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
-        return
+_MOD_LOG_COLORES = {
+    moderation_core.WARN: 0xB0413E,
+    moderation_core.TIMEOUT: BRAND_BEACON_AMBER,
+    moderation_core.KICK: 0xB0413E,
+    moderation_core.BAN: 0x8B0000,
+    moderation_core.UNBAN: BRAND_RADAR_GREEN,
+}
 
-    await interaction.response.defer(ephemeral=True)
-    try:
-        data = await _consulta_web_post("/api/bot/warnings", {
-            "discordId": str(miembro.id),
-            "moderatorId": str(interaction.user.id),
-            "moderatorName": str(interaction.user),
-            "reason": motivo,
-        })
-    except Exception as err:
-        await interaction.followup.send(f"No pude registrar la advertencia: {err}", ephemeral=True)
-        return
 
-    total = data.get("total", "?")
-    await interaction.followup.send(
-        f"{E['cruz']} Advertencia registrada para {miembro.mention}. Ahora tiene **{total}** advertencia(s).",
-        ephemeral=True,
+async def _registrar_caso_moderacion(*, miembro: discord.abc.User, moderador: discord.abc.User, accion: str,
+                                      motivo: str, duracion_minutos: int = None) -> dict:
+    """Punto único donde se crea un caso Y se loguea — antes cada comando
+    (solo /advertir existía) repetía su propia lógica de log inline; ahora
+    /timeout, /kick y /ban comparten el mismo formato de registro."""
+    caso = await moderation_core.create_case(
+        db, user_id=str(miembro.id), moderator_id=str(moderador.id), moderator_name=str(moderador),
+        action=accion, reason=motivo, duration_minutes=duracion_minutos,
     )
-
-    try:
-        embed_dm = discord.Embed(
-            title=f"{E['cruz']} Recibiste una advertencia",
-            description="Se registró una advertencia formal a tu nombre en **ATC24 Español**. Por favor, evitá que se repita.",
-            color=0xB0413E,
-        )
-        embed_dm.add_field(name="Motivo", value=motivo, inline=False)
-        embed_dm.add_field(name="Total de advertencias", value=str(total), inline=True)
-        embed_dm.set_footer(text="¿Crees que fue un error? Abrí un ticket con /reportar.")
-        await miembro.send(embed=embed_dm)
-    except discord.Forbidden:
-        pass  # MD cerrados — no rompe el flujo, la advertencia ya quedó registrada
-
     if DISCORD_CHANNEL_MOD_LOG:
         canal_log = client.get_channel(int(DISCORD_CHANNEL_MOD_LOG))
         if canal_log:
-            embed_log = discord.Embed(title=f"{E['cruz']} Nueva advertencia", color=0xB0413E)
+            etiqueta = moderation_core.ACTION_LABELS.get(accion, accion)
+            embed_log = discord.Embed(title=f"Caso #{caso['id']} — {etiqueta}", color=_MOD_LOG_COLORES.get(accion, BRAND_SKY_NAVY))
             embed_log.add_field(name="Usuario", value=miembro.mention, inline=True)
-            embed_log.add_field(name="Por", value=interaction.user.mention, inline=True)
-            embed_log.add_field(name="Total acumulado", value=str(total), inline=True)
-            embed_log.add_field(name="Motivo", value=motivo, inline=False)
+            embed_log.add_field(name="Por", value=moderador.mention, inline=True)
+            if duracion_minutos:
+                embed_log.add_field(name="Duración", value=f"{duracion_minutos} min", inline=True)
+            embed_log.add_field(name="Motivo", value=motivo or "—", inline=False)
             await canal_log.send(embed=embed_log)
+    return caso
 
 
-@tree.command(name="advertencias", description="Consulta tus advertencias, o las de otro usuario si eres Instructor/Staff")
-@app_commands.describe(usuario="Usuario a consultar (déjalo vacío para ver las tuyas)")
+async def _avisar_por_dm(usuario: discord.abc.User, *, titulo: str, descripcion: str, motivo: str, color: int) -> None:
+    try:
+        embed_dm = discord.Embed(title=titulo, description=descripcion, color=color)
+        embed_dm.add_field(name="Motivo", value=motivo or "—", inline=False)
+        embed_dm.set_footer(text="¿Crees que fue un error? Abrí un ticket con /reportar.")
+        await usuario.send(embed=embed_dm)
+    except discord.Forbidden:
+        pass  # MD cerrados — no rompe el flujo, el caso ya quedó registrado
+
+
+@tree.command(name="advertir", description="Registra una advertencia formal a un usuario (Instructores/Staff)")
+@app_commands.default_permissions()
+@app_commands.describe(miembro="Usuario a advertir", motivo="Motivo detallado — queda registrado y se le manda por MD")
+async def advertir(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
+    if not es_staff_moderacion(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    caso = await _registrar_caso_moderacion(miembro=miembro, moderador=interaction.user, accion=moderation_core.WARN, motivo=motivo)
+    total = await moderation_core.count_active_warns(db, str(miembro.id))
+    await interaction.followup.send(
+        f"{E['cruz']} Advertencia (caso **#{caso['id']}**) registrada para {miembro.mention}. Ahora tiene **{total}** advertencia(s) activa(s).",
+        ephemeral=True,
+    )
+    await _avisar_por_dm(
+        miembro, titulo=f"{E['cruz']} Recibiste una advertencia",
+        descripcion="Se registró una advertencia formal a tu nombre en **ATC24 Español**. Por favor, evitá que se repita.",
+        motivo=motivo, color=0xB0413E,
+    )
+
+
+@tree.command(name="timeout", description="Aplica un timeout (silencio temporal) a un usuario y registra el caso")
+@app_commands.default_permissions()
+@app_commands.describe(
+    miembro="Usuario a silenciar", minutos="Duración en minutos (máx. 40320 = 28 días)",
+    motivo="Motivo del timeout — queda registrado y se le manda por MD",
+)
+async def timeout_cmd(interaction: discord.Interaction, miembro: discord.Member, minutos: app_commands.Range[int, 1, 40320], motivo: str):
+    if not es_staff_moderacion(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await miembro.timeout(datetime.timedelta(minutes=minutos), reason=motivo)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permiso para silenciar a ese usuario (¿mi rol está por debajo del suyo?).", ephemeral=True)
+        return
+    except discord.HTTPException as err:
+        await interaction.followup.send(f"Discord rechazó el timeout: {err}", ephemeral=True)
+        return
+    caso = await _registrar_caso_moderacion(
+        miembro=miembro, moderador=interaction.user, accion=moderation_core.TIMEOUT, motivo=motivo, duracion_minutos=minutos
+    )
+    await interaction.followup.send(f"{miembro.mention} silenciado por {minutos} min (caso **#{caso['id']}**). ✅", ephemeral=True)
+    await _avisar_por_dm(
+        miembro, titulo="Fuiste silenciado temporalmente",
+        descripcion=f"Se te aplicó un timeout de {minutos} minutos en **ATC24 Español**.",
+        motivo=motivo, color=BRAND_BEACON_AMBER,
+    )
+
+
+@tree.command(name="kick", description="Expulsa a un usuario del servidor — puede volver a unirse (solo Liderazgo)")
+@app_commands.default_permissions()
+@app_commands.describe(miembro="Usuario a expulsar", motivo="Motivo de la expulsión — se le manda por MD antes de expulsarlo")
+async def kick_cmd(interaction: discord.Interaction, miembro: discord.Member, motivo: str):
+    if not es_staff_senior(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Liderazgo.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _avisar_por_dm(
+        miembro, titulo="Fuiste expulsado",
+        descripcion="Se te expulsó de **ATC24 Español**. Podés volver a unirte si corresponde.",
+        motivo=motivo, color=0xB0413E,
+    )
+    try:
+        await miembro.kick(reason=motivo)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permiso para expulsar a ese usuario (¿mi rol está por debajo del suyo?).", ephemeral=True)
+        return
+    caso = await _registrar_caso_moderacion(miembro=miembro, moderador=interaction.user, accion=moderation_core.KICK, motivo=motivo)
+    await interaction.followup.send(f"{miembro.mention} expulsado (caso **#{caso['id']}**). ✅", ephemeral=True)
+
+
+@tree.command(name="ban", description="Banea a un usuario del servidor de forma permanente (solo Liderazgo)")
+@app_commands.default_permissions()
+@app_commands.describe(
+    miembro="Usuario a banear", motivo="Motivo del ban — se le manda por MD antes de banearlo",
+    borrar_mensajes_dias="Borrar también sus mensajes de los últimos N días (0-7, opcional)",
+)
+async def ban_cmd(interaction: discord.Interaction, miembro: discord.Member, motivo: str,
+                   borrar_mensajes_dias: app_commands.Range[int, 0, 7] = 0):
+    if not es_staff_senior(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Liderazgo.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _avisar_por_dm(
+        miembro, titulo="Fuiste baneado", descripcion="Se te baneó de **ATC24 Español**.",
+        motivo=motivo, color=0x8B0000,
+    )
+    try:
+        await miembro.ban(reason=motivo, delete_message_seconds=borrar_mensajes_dias * 86400)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permiso para banear a ese usuario (¿mi rol está por debajo del suyo?).", ephemeral=True)
+        return
+    caso = await _registrar_caso_moderacion(miembro=miembro, moderador=interaction.user, accion=moderation_core.BAN, motivo=motivo)
+    await interaction.followup.send(f"{miembro.mention} baneado (caso **#{caso['id']}**). ✅", ephemeral=True)
+
+
+@tree.command(name="advertencias", description="Consulta tu historial de moderación, o el de otro usuario si eres Instructor/Staff")
+@app_commands.describe(usuario="Usuario a consultar (déjalo vacío para ver el tuyo)")
 async def advertencias(interaction: discord.Interaction, usuario: discord.Member = None):
     objetivo = usuario or interaction.user
-    if usuario and usuario.id != interaction.user.id and not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
-        await interaction.response.send_message("Solo Instructores/Staff pueden ver las advertencias de otra persona.", ephemeral=True)
+    if usuario and usuario.id != interaction.user.id and not es_staff_moderacion(interaction.user):
+        await interaction.response.send_message("Solo Instructores/Staff pueden ver el historial de otra persona.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    try:
-        data = await _consulta_web(f"/api/bot/warnings/{objetivo.id}")
-    except Exception as err:
-        await interaction.followup.send(f"No pude consultar las advertencias: {err}", ephemeral=True)
+    casos = await moderation_core.cases_for_user(db, str(objetivo.id))
+    if not casos:
+        await interaction.followup.send(f"{objetivo.mention} no tiene casos de moderación registrados.", ephemeral=True)
         return
 
-    items = data.get("items", [])
-    if not items:
-        await interaction.followup.send(f"{objetivo.mention} no tiene advertencias registradas.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title=f"Advertencias de {objetivo.display_name}", color=0xB0413E)
-    for w in items[:10]:
-        fecha = datetime.datetime.fromtimestamp(w["at"] / 1000, tz=datetime.timezone.utc).strftime("%d/%m/%Y")
-        quien = w.get("moderatorName") or w.get("moderatorId") or "—"
-        embed.add_field(name=f"{fecha} — por {quien}", value=w.get("reason") or "—", inline=False)
-    if len(items) > 10:
-        embed.set_footer(text=f"Mostrando las 10 más recientes de {len(items)} en total.")
+    embed = discord.Embed(title=f"Historial de {objetivo.display_name}", color=0xB0413E)
+    for c in casos[:10]:
+        fecha = datetime.datetime.fromisoformat(c["created_at"]).strftime("%d/%m/%Y")
+        etiqueta = moderation_core.ACTION_LABELS.get(c["action"], c["action"])
+        estado = "" if c["active"] else " _(revocado)_"
+        embed.add_field(name=f"Caso #{c['id']} — {etiqueta} — {fecha}{estado}", value=c.get("reason") or "—", inline=False)
+    if len(casos) > 10:
+        embed.set_footer(text=f"Mostrando los 10 más recientes de {len(casos)} en total.")
     else:
-        embed.set_footer(text=f"Total: {len(items)}")
+        embed.set_footer(text=f"Total: {len(casos)}")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="borrar", description="Borra una cantidad de mensajes recientes de este canal")
+class ModPanelRevocarSelect(discord.ui.Select):
+    def __init__(self, opciones: list):
+        super().__init__(placeholder="Revocar un caso activo…", options=opciones, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        vista: "ModPanelView" = self.view
+        if interaction.user.id != vista.autor_id:
+            await interaction.response.send_message("Solo quien abrió este panel puede usarlo.", ephemeral=True)
+            return
+        caso = await moderation_core.revoke_case(db, int(self.values[0]))
+        if caso:
+            await interaction.response.send_message(f"Caso **#{caso['id']}** revocado. ✅", ephemeral=True)
+        else:
+            await interaction.response.send_message("No encontré ese caso.", ephemeral=True)
+
+
+class ModPanelView(discord.ui.View):
+    def __init__(self, casos: list, autor_id: int):
+        super().__init__(timeout=180)
+        self.autor_id = autor_id
+        opciones = [
+            discord.SelectOption(
+                label=f"Caso #{c['id']} — {moderation_core.ACTION_LABELS.get(c['action'], c['action'])}"[:100],
+                description=(c.get("reason") or "—")[:100],
+                value=str(c["id"]),
+            )
+            for c in casos if c["active"]
+        ][:25]
+        if opciones:
+            self.add_item(ModPanelRevocarSelect(opciones))
+
+
+@tree.command(name="panel-moderacion", description="Abre el panel de moderación de un usuario: historial completo y revocar casos")
 @app_commands.default_permissions()
-@app_commands.describe(cantidad="Cuántos mensajes borrar (entre 1 y 100)")
-async def borrar(interaction: discord.Interaction, cantidad: app_commands.Range[int, 1, 100]):
-    if not has_any_role(interaction.user, LIDERAZGO_ORDER + INSTRUCTOR_ORDER):
+@app_commands.describe(miembro="Usuario cuyo historial de moderación se va a revisar")
+async def panel_moderacion(interaction: discord.Interaction, miembro: discord.Member):
+    if not es_staff_moderacion(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    casos = await moderation_core.cases_for_user(db, str(miembro.id))
+    embed = discord.Embed(title=f"Panel de moderación — {miembro.display_name}", color=BRAND_SKY_NAVY)
+    if not casos:
+        embed.description = "Sin casos registrados."
+    else:
+        activas = sum(1 for c in casos if c["action"] == moderation_core.WARN and c["active"])
+        embed.description = f"{len(casos)} caso(s) en total · {activas} advertencia(s) activa(s)"
+        for c in casos[:10]:
+            fecha = datetime.datetime.fromisoformat(c["created_at"]).strftime("%d/%m/%Y")
+            etiqueta = moderation_core.ACTION_LABELS.get(c["action"], c["action"])
+            estado = "" if c["active"] else " _(revocado)_"
+            embed.add_field(name=f"Caso #{c['id']} — {etiqueta} — {fecha}{estado}", value=c.get("reason") or "—", inline=False)
+    await interaction.followup.send(embed=embed, view=ModPanelView(casos, interaction.user.id), ephemeral=True)
+
+
+@tree.command(name="borrar-mensajes", description="Borra en bloque los mensajes más recientes de este canal")
+@app_commands.default_permissions()
+@app_commands.describe(cantidad="Cuántos mensajes borrar (entre 1 y 100; Discord no permite borrar los de más de 14 días)")
+async def borrar_mensajes(interaction: discord.Interaction, cantidad: app_commands.Range[int, 1, 100]):
+    if not es_staff_moderacion(interaction.user):
         await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
         return
     if not isinstance(interaction.channel, discord.TextChannel):
@@ -1715,7 +2267,7 @@ class TicketPanelView(discord.ui.View):
         await interaction.response.send_modal(TicketModal())
 
 
-@tree.command(name="panel-soporte", description="Publica en este canal el panel fijo para abrir tickets de soporte")
+@tree.command(name="panel-soporte", description="Publica el panel fijo de tickets de soporte en este canal (Staff)")
 @app_commands.default_permissions()
 async def panel_soporte(interaction: discord.Interaction):
     if not has_any_role(interaction.user, LIDERAZGO_ORDER):
@@ -1741,18 +2293,18 @@ async def panel_soporte(interaction: discord.Interaction):
     await interaction.response.send_message("Panel de soporte publicado en este canal.", ephemeral=True)
 
 
-@tree.command(name="reportar", description="Abre un ticket privado de soporte para reportar una incidencia")
+@tree.command(name="reportar", description="Abre un ticket privado con el staff para reportar un problema o hacer una consulta")
 async def reportar(interaction: discord.Interaction):
     await interaction.response.send_modal(TicketModal())
 
 
-@tree.command(name="eco", description="Envía un mensaje formal en nombre del bot (a un canal, por mensaje directo, o en este mismo canal)")
+@tree.command(name="anunciar", description="Publica un anuncio formal en nombre del bot — en un canal, por MD, o aquí mismo")
 @app_commands.default_permissions()
 @app_commands.describe(
     canal="Canal donde publicarlo (si se deja vacío junto con usuario, se manda en este mismo canal)",
-    usuario="Usuario a quien mandárselo por MD",
+    usuario="Usuario a quien mandárselo por MD en vez de publicarlo en un canal",
 )
-async def eco(
+async def anunciar(
     interaction: discord.Interaction,
     canal: discord.TextChannel = None,
     usuario: discord.Member = None,
@@ -1891,10 +2443,9 @@ async def _publicar_payload_crudo(channel_id: int, payload: dict):
 
 
 # ─── Mensajes de plan de vuelo (Components V2, con nombre real de Roblox) ──
-# La web (repo ATC24Espanol) ya no manda estos por webhook — le avisa a este
-# bot vía POST /discord/evento-vuelo (protegido con BOT_SHARED_SECRET), y acá
-# se arma el mensaje con Bloxlink y se crea/edita — 1 solo mensaje por plan,
-# igual que ya hacía la web antes de este cambio.
+# Desde la Fase A el bot ya no depende de un webhook de la web para esto:
+# /vuelo y /vuelo-cerrar arman el mensaje acá mismo (con Bloxlink) y lo
+# crean/editan — 1 solo mensaje por plan.
 _flight_message_ids = {}  # operationUuid -> message_id (en memoria; se pierde si el bot reinicia)
 # Un lock POR VUELO (no uno global — no hace falta serializar vuelos
 # distintos entre sí). Sin esto: si dos eventos del MISMO vuelo llegan casi
@@ -1922,6 +2473,7 @@ ESTADO_VUELO_LABEL = {
     "FlightCompleted": ("Vuelo finalizado", 0x2A9D74),
     "FlightWithdrawn": ("Vuelo retirado", 0xB0413E),
     "FlightEdited": ("Plan de vuelo editado", BRAND_SKY_NAVY),
+    "FlightExpired": ("Plan de vuelo expirado (nunca se cerró)", 0x6B7280),
 }
 
 
@@ -1988,39 +2540,6 @@ async def _enviar_o_editar_vuelo(op_uuid: str, payload: dict):
         _flight_message_ids[op_uuid] = data["id"]
 
 
-async def _evento_vuelo(request):
-    """Recibe los eventos de plan de vuelo desde la web (ATC24Espanol)."""
-    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
-        return web.json_response({"error": "unauthorized"}, status=401)
-    if not DISCORD_CHANNEL_FLIGHTS:
-        return web.json_response({"error": "channel_not_configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid_json"}, status=400)
-
-    tipo = body.get("type")
-    op = body.get("operation") or {}
-    actor = body.get("actor") or {}
-    op_uuid = op.get("uuid")
-    actor_id = actor.get("discordId")
-    if not op_uuid or not actor_id:
-        return web.json_response({"error": "missing_fields"}, status=400)
-
-    try:
-        roblox_name = await _roblox_username(int(actor_id))
-    except Exception:
-        roblox_name = None
-
-    payload = _construir_payload_vuelo(op, actor_id, tipo, roblox_name)
-    try:
-        await _enviar_o_editar_vuelo(op_uuid, payload)
-    except Exception as err:
-        print(f"ERROR al mandar/editar mensaje de vuelo: {err}")
-        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
-    return web.json_response({"ok": True})
-
-
 # ─── Anuncio de posición ATC abierta (Components V2, mención de rol) ──────
 def _construir_payload_atc_abierto(op: dict, actor_id: str):
     lineas = [
@@ -2042,59 +2561,14 @@ def _construir_payload_atc_abierto(op: dict, actor_id: str):
     }
 
 
-async def _evento_atc(request):
-    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
-        return web.json_response({"error": "unauthorized"}, status=401)
-    if not DISCORD_CHANNEL_ATC:
-        return web.json_response({"error": "channel_not_configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid_json"}, status=400)
-
-    op = body.get("operation") or {}
-    actor = body.get("actor") or {}
-    actor_id = actor.get("discordId")
-    duracion_min = max(1, body.get("durationMin") or 1)
-    if not actor_id:
-        return web.json_response({"error": "missing_fields"}, status=400)
-
-    payload = _construir_payload_atc_abierto(op, actor_id)
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-    try:
-        status, data, texto = await _discord_request(
-            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages",
-            headers=headers, json_body=payload,
-        )
-        if status >= 300:
-            raise RuntimeError(f"Discord respondió {status}: {texto or data}")
-        mensaje_id = data["id"]
-    except Exception as err:
-        print(f"ERROR al mandar anuncio ATC: {err}")
-        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
-
-    async def _autoborrar():
-        await asyncio.sleep(duracion_min * 60)
-        try:
-            await _discord_request(
-                "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ATC}/messages/{mensaje_id}",
-                headers=headers,
-            )
-        except Exception:
-            pass
-
-    asyncio.create_task(_autoborrar())
-    return web.json_response({"ok": True})
-
-
 # ─── Tabla "ATC Online" — un único mensaje, siempre el último del canal ───
-# La web le manda la lista de posiciones activas a este endpoint cada vez
-# que alguien abre o cierra una posición, y el bot borra el mensaje anterior
-# (si existe) y publica uno nuevo. Además, cualquier mensaje humano nuevo en
-# el canal ATC dispara el mismo repost (ver on_message) para que la tabla
-# quede siempre como el último mensaje del canal — por eso se guarda también
-# la última lista de activos recibida, para poder reconstruir el mismo
-# payload sin depender de que la web vuelva a mandarlo.
+# Desde la Fase A, /atc y /atc-cerrar llaman a _repostear_tabla_atc()
+# directamente (in-process) cada vez que cambia una posición — el bot borra
+# el mensaje anterior (si existe) y publica uno nuevo. Además, cualquier
+# mensaje humano nuevo en el canal ATC dispara el mismo repost (ver
+# on_message) para que la tabla quede siempre como el último mensaje del
+# canal — por eso se guarda también la última lista de activos, para poder
+# reconstruir el mismo payload sin volver a consultar la base.
 _tabla_atc_message_id = None
 _tabla_atc_ultimos_activos: list = []
 # Sin este lock, dos reposts casi simultáneos (ej. dos mensajes seguidos en
@@ -2112,23 +2586,29 @@ SOLICITAR_CONTROL_CUSTOM_ID = "atc24:solicitar_control"
 
 
 def _construir_payload_tabla_atc(activos: list):
+    ahora_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     if not activos:
-        lineas = ["No hay ninguna posición ATC abierta ahora mismo."]
+        cuerpo = "_No hay ninguna posición ATC abierta ahora mismo._"
     else:
         por_aeropuerto = {}
         for op in activos:
             ap = op.get("airport") or "----"
             por_aeropuerto.setdefault(ap, []).append(op)
-        lineas = [f"{len(activos)} posición(es) abierta(s) ahora mismo", ""]
+        bloques = []
         for ap in sorted(por_aeropuerto):
-            lineas.append(f"**{ap}**")
-            for op in por_aeropuerto[ap]:
+            filas = [f"**{ap}**"]
+            for op in sorted(por_aeropuerto[ap], key=lambda o: o.get("positionType") or ""):
                 pos = op.get("positionType") or "---"
                 owner = op.get("ownerId")
                 quien = f"<@{owner}>" if owner else (op.get("controllerName") or "—")
                 freq = op.get("frequency") or "---.---"
-                lineas.append(f"`{ap}_{pos}` — {quien} ({freq})")
-            lineas.append("")
+                filas.append(f"`{ap}_{pos:<4}` {quien} · **{freq}**")
+            bloques.append("\n".join(filas))
+        cuerpo = "\n\n".join(bloques)
+    lineas = [
+        f"{E['atc']} **ATC24 Español · Controladores en línea**",
+        f"-# {len(activos)} posición(es) abierta(s) · actualizado <t:{ahora_ts}:R>",
+    ]
     return {
         "flags": 32768,
         "allowed_mentions": {"parse": []},
@@ -2136,9 +2616,9 @@ def _construir_payload_tabla_atc(activos: list):
             {
                 "type": 17, "accent_color": BRAND_RADAR_GREEN,
                 "components": [
-                    {"type": 10, "content": "**Controladores en línea**"},
+                    {"type": 10, "content": "\n".join(lineas)},
                     {"type": 14, "divider": True, "spacing": 1},
-                    {"type": 10, "content": "\n".join(lineas).strip()},
+                    {"type": 10, "content": cuerpo},
                     {
                         "type": 1,
                         "components": [
@@ -2204,23 +2684,268 @@ async def _repostear_tabla_atc(activos: list):
         _tabla_atc_message_id = data["id"]
 
 
-async def _evento_tabla_atc(request):
-    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
-        return web.json_response({"error": "unauthorized"}, status=401)
-    if not DISCORD_CHANNEL_ATC:
-        return web.json_response({"error": "channel_not_configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid_json"}, status=400)
+# ─── Sesiones agendadas de Academia (Components V2) ───────────────────────
+# Un instructor agenda con /academia-agendar (categoría + curso libres, no
+# ligado al catálogo formal de academy_core — mantiene el agendado simple).
+# Panel "Sesiones agendadas" = 1 solo mensaje que se EDITA in-place (a
+# diferencia de la tabla ATC, no hace falta que sea el último mensaje del
+# canal). Cuando llega la hora, se publica un anuncio nuevo con Unirse/
+# Salir/Ver alumnos — los botones se enrutan por custom_id dinámico
+# (academy_session:<accion>:<uuid>) desde on_interaction, igual que el resto
+# de los paneles Components V2 de este bot.
+SOLICITAR_SESION_CUSTOM_ID = "atc24:solicitar_sesion"
+_sesiones_message_id = None
+_sesiones_lock = asyncio.Lock()
+_ultima_solicitud_sesion = {}  # discord_id -> timestamp de asyncio loop
 
+
+def _construir_payload_sesiones_agendadas(sesiones: list):
+    if not sesiones:
+        cuerpo = "_No hay sesiones agendadas por ahora. Un instructor puede agendar una con `/academia-agendar`._"
+    else:
+        por_categoria: dict = {}
+        orden = []
+        for s in sesiones:
+            cat = s["category"]
+            if cat not in por_categoria:
+                por_categoria[cat] = []
+                orden.append(cat)
+            por_categoria[cat].append(s)
+        bloques = []
+        for cat in orden:
+            filas = [f"**{cat}**"]
+            for s in por_categoria[cat]:
+                ts = int(s["scheduled_at"] / 1000)
+                cupo = f"{s['_inscritos']}/{s['max_students']}" if s["max_students"] is not None else str(s["_inscritos"])
+                filas.append(f"`{s['course_title']}` ({cupo}) — <t:{ts}:R> — <@{s['instructor_id']}>")
+            bloques.append("\n".join(filas))
+        cuerpo = "\n\n".join(bloques)
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17, "accent_color": BRAND_BEACON_AMBER,
+                "components": [
+                    {"type": 10, "content": f"{E['libro']} **ATC24 Español — Sesiones de Academia agendadas**"},
+                    {"type": 14, "divider": True, "spacing": 1},
+                    {"type": 10, "content": cuerpo},
+                    {
+                        "type": 1,
+                        "components": [
+                            {"type": 2, "style": 3, "label": "Solicitar una sesión", "custom_id": SOLICITAR_SESION_CUSTOM_ID},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+async def _repostear_sesiones_agendadas():
+    """Edita in-place el panel de sesiones agendadas (crea uno si todavía no
+    existe). A diferencia de la tabla ATC no hace falta que sea el último
+    mensaje del canal, así que editar alcanza — no hay que borrar/recrear."""
+    global _sesiones_message_id
+    if not DISCORD_CHANNEL_ACADEMIA_SESIONES:
+        return
+    async with _sesiones_lock:
+        sesiones = await sessions_core.upcoming_sessions(db)
+        for s in sesiones:
+            s["_inscritos"] = await sessions_core.count_signups(db, s["uuid"])
+        payload = _construir_payload_sesiones_agendadas(sesiones)
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+
+        if _sesiones_message_id:
+            status, data, texto = await _discord_request(
+                "PATCH", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages/{_sesiones_message_id}",
+                headers=headers, json_body=payload,
+            )
+            if status < 300:
+                return
+            if status != 404:
+                print(f"Aviso: no pude editar el panel de sesiones agendadas: {status} {texto or data}")
+                return
+            _sesiones_message_id = None  # lo borraron a mano — cae a crear uno nuevo abajo
+
+        status, data, texto = await _discord_request(
+            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages",
+            headers=headers, json_body=payload,
+        )
+        if status >= 300:
+            print(f"Aviso: no pude publicar el panel de sesiones agendadas: {status} {texto or data}")
+            return
+        _sesiones_message_id = data["id"]
+
+
+async def _procesar_solicitud_sesion(interaction: discord.Interaction):
+    ahora = asyncio.get_running_loop().time()
+    anterior = _ultima_solicitud_sesion.get(interaction.user.id)
+    if anterior and ahora - anterior < SOLICITUD_CONTROL_COOLDOWN:
+        restante = int(SOLICITUD_CONTROL_COOLDOWN - (ahora - anterior))
+        await interaction.response.send_message(
+            f"Ya pediste una sesión hace poco. Puedes volver a hacerlo en {restante} segundos.", ephemeral=True,
+        )
+        return
+    _ultima_solicitud_sesion[interaction.user.id] = ahora
+    await interaction.response.send_message("Tu solicitud fue enviada a los instructores.", ephemeral=True)
+    payload = {
+        "flags": 32768,
+        "allowed_mentions": {"parse": [], "roles": [str(rid) for rid in INSTRUCTOR_ORDER]},
+        "components": [
+            {
+                "type": 17, "accent_color": BRAND_BEACON_AMBER,
+                "components": [
+                    {"type": 10, "content": f"{interaction.user.mention} pidió que se agende una nueva sesión de Academia. Usa `/academia-agendar`."},
+                ],
+            }
+        ],
+    }
+    if DISCORD_CHANNEL_ACADEMIA_SESIONES:
+        try:
+            await _publicar_payload_crudo(int(DISCORD_CHANNEL_ACADEMIA_SESIONES), payload)
+        except Exception as err:
+            print(f"ERROR al notificar solicitud de sesión: {err}")
+
+
+def _construir_payload_sesion_en_vivo(sesion: dict, inscritos: int):
+    ts = int(sesion["scheduled_at"] / 1000)
+    cupo = f"{inscritos}/{sesion['max_students']}" if sesion["max_students"] is not None else str(inscritos)
+    lineas = [
+        f"**{sesion['course_title']}: en curso**",
+        "",
+        f"<@{sesion['instructor_id']}> está dando una sesión de **{sesion['course_title']}** "
+        f"(agendada <t:{ts}:R>) enfocada en **{sesion['category']}**. "
+        f"Hay actualmente **{cupo}** alumno(s) anotados. Usa **Ver alumnos** para ver quién está anotado.",
+    ]
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17, "accent_color": BRAND_RADAR_GREEN,
+                "components": [
+                    {"type": 10, "content": "\n".join(lineas)},
+                    {
+                        "type": 1,
+                        "components": [
+                            {"type": 2, "style": 3, "label": "Unirse", "custom_id": f"academy_session:join:{sesion['uuid']}"},
+                            {"type": 2, "style": 4, "label": "Salir", "custom_id": f"academy_session:leave:{sesion['uuid']}"},
+                            {"type": 2, "style": 2, "label": "Ver alumnos", "custom_id": f"academy_session:students:{sesion['uuid']}"},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+async def _publicar_sesion_en_vivo(sesion: dict):
+    if not DISCORD_CHANNEL_ACADEMIA_SESIONES:
+        return
+    inscritos = await sessions_core.count_signups(db, sesion["uuid"])
+    payload = _construir_payload_sesion_en_vivo(sesion, inscritos)
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    status, data, texto = await _discord_request(
+        "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages",
+        headers=headers, json_body=payload,
+    )
+    if status >= 300:
+        print(f"Aviso: no pude publicar la sesión en vivo {sesion['uuid']}: {status} {texto or data}")
+        return
+    await sessions_core.set_live(db, sesion["uuid"], DISCORD_CHANNEL_ACADEMIA_SESIONES, data["id"])
+
+
+async def _actualizar_mensaje_sesion_en_vivo(sesion: dict):
+    if not sesion.get("channel_id") or not sesion.get("message_id"):
+        return
+    inscritos = await sessions_core.count_signups(db, sesion["uuid"])
+    payload = _construir_payload_sesion_en_vivo(sesion, inscritos)
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    status, data, texto = await _discord_request(
+        "PATCH", f"https://discord.com/api/v10/channels/{sesion['channel_id']}/messages/{sesion['message_id']}",
+        headers=headers, json_body=payload,
+    )
+    if status >= 300 and status != 404:
+        print(f"Aviso: no pude actualizar el panel de la sesión en vivo {sesion['uuid']}: {status} {texto or data}")
+
+
+async def _sesiones_academia_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            vencidas = await sessions_core.due_sessions(db)
+            for s in vencidas:
+                await _publicar_sesion_en_vivo(s)
+            if vencidas:
+                await _repostear_sesiones_agendadas()
+        except Exception as err:
+            print(f"Aviso: fallo en el loop de sesiones de Academia: {err}")
+
+
+async def _procesar_boton_sesion(interaction: discord.Interaction, accion: str, session_uuid: str):
+    sesion = await sessions_core.get_session(db, session_uuid)
+    if not sesion or sesion["state"] != sessions_core.LIVE:
+        await interaction.response.send_message("Esta sesión ya no está activa.", ephemeral=True)
+        return
+
+    if accion == "join":
+        resultado = await sessions_core.sign_up(db, session_uuid, str(interaction.user.id))
+        if resultado == "already":
+            await interaction.response.send_message("Ya estás anotado en esta sesión.", ephemeral=True)
+            return
+        if resultado == "full":
+            await interaction.response.send_message("Esta sesión ya no tiene cupo disponible.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Te anotaste a **{sesion['course_title']}**. ✅", ephemeral=True)
+        await _actualizar_mensaje_sesion_en_vivo(await sessions_core.get_session(db, session_uuid))
+        return
+
+    if accion == "leave":
+        if not await sessions_core.leave(db, session_uuid, str(interaction.user.id)):
+            await interaction.response.send_message("No estabas anotado en esta sesión.", ephemeral=True)
+            return
+        await interaction.response.send_message("Saliste de la sesión.", ephemeral=True)
+        await _actualizar_mensaje_sesion_en_vivo(await sessions_core.get_session(db, session_uuid))
+        return
+
+    if accion == "students":
+        alumnos = await sessions_core.list_signups(db, session_uuid)
+        if not alumnos:
+            await interaction.response.send_message("Todavía no hay alumnos anotados.", ephemeral=True)
+            return
+        texto = "\n".join(f"• <@{uid}>" for uid in alumnos)
+        await interaction.response.send_message(f"**Alumnos anotados a {sesion['course_title']}:**\n{texto}", ephemeral=True)
+
+
+@tree.command(name="academia-agendar", description="Agenda una nueva sesión de clase y la publica en el panel de sesiones")
+@app_commands.describe(
+    categoria="Categoría/tema de la sesión (ej. Basic Operations Theory)",
+    curso="Nombre del curso/sesión (ej. RPL Course)",
+    en_minutos="En cuántos minutos empieza (ej. 60 para dentro de una hora)",
+    cupo="Cupo máximo de alumnos (opcional, sin límite si se deja vacío)",
+)
+async def academia_agendar(
+    interaction: discord.Interaction, categoria: str, curso: str,
+    en_minutos: app_commands.Range[int, 1, 43200], cupo: app_commands.Range[int, 1, 200] = None,
+):
+    if not es_staff_moderacion(interaction.user):
+        await interaction.response.send_message("Este comando es solo para Instructores/Staff.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    programado_ms = int(
+        (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=en_minutos)).timestamp() * 1000
+    )
+    await sessions_core.create_session(
+        db, category=categoria, course_title=curso, instructor_id=str(interaction.user.id),
+        scheduled_at_ms=programado_ms, max_students=cupo,
+    )
     try:
-        await _repostear_tabla_atc(body.get("activeAtc") or [])
+        await _repostear_sesiones_agendadas()
     except Exception as err:
-        print(f"ERROR al actualizar la tabla de ATC Online: {err}")
-        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
-
-    return web.json_response({"ok": True})
+        print(f"ERROR al actualizar el panel de sesiones agendadas: {err}")
+    ts = int(programado_ms / 1000)
+    await interaction.followup.send(f"Sesión **{curso}** agendada para <t:{ts}:R>. ✅", ephemeral=True)
 
 
 # ─── Solicitud formal de apertura de posición (botón en la tabla ATC) ─────
@@ -2423,7 +3148,7 @@ class PanelATCView(discord.ui.View):
         await interaction.response.send_modal(AnuncioATCModal())
 
 
-@tree.command(name="panel-atc", description="Abre el panel de herramientas para Controladores de Tráfico Aéreo")
+@tree.command(name="panel-atc", description="Abre el panel de herramientas para Controladores de Tráfico Aéreo (rol ATC)")
 @app_commands.default_permissions()
 async def panel_atc(interaction: discord.Interaction):
     if not has_any_role(interaction.user, ATC_ORDER + [ATC_ROLE_ID]):
@@ -2474,23 +3199,40 @@ def _construir_payload_atis(e: dict):
     }
 
 
-async def _evento_atis(request):
-    if not BOT_SHARED_SECRET or request.headers.get("x-bot-secret") != BOT_SHARED_SECRET:
-        return web.json_response({"error": "unauthorized"}, status=401)
+@tree.command(name="atis", description="Publica un ATIS (información meteorológica y de pista) en el canal correspondiente")
+@app_commands.describe(
+    aeropuerto="ICAO del aeródromo (ej. SBGR)", ident="Letra de información (ej. A, B, C)",
+    pista_salida="Pista de salida (ej. 09L)", pista_llegada="Pista de llegada (déjalo vacío si es la misma)",
+    viento="Viento en formato dirección/velocidad (ej. 250/12)", visibilidad="Ej. CAVOK o 8000m",
+    nubes="Ej. SKC, FEW020", qnh="Presión QNH (ej. 1013)", nivel_transicion="Nivel de transición (ej. FL60)",
+    observaciones="Cualquier información adicional (opcional)",
+)
+async def atis(
+    interaction: discord.Interaction, aeropuerto: str, ident: str,
+    pista_salida: str = None, pista_llegada: str = None, viento: str = None,
+    visibilidad: str = None, nubes: str = None, qnh: str = None,
+    nivel_transicion: str = None, observaciones: str = None,
+):
+    if not (has_any_role(interaction.user, ATC_ORDER) or has_any_role(interaction.user, LIDERAZGO_ORDER)):
+        await interaction.response.send_message("Este comando es solo para controladores (rol ATC).", ephemeral=True)
+        return
     if not DISCORD_CHANNEL_ATIS:
-        return web.json_response({"error": "channel_not_configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid_json"}, status=400)
-
-    payload = _construir_payload_atis(body)
+        await interaction.response.send_message("No hay un canal de ATIS configurado (DISCORD_CHANNEL_ATIS).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    payload = _construir_payload_atis({
+        "airport": aeropuerto, "ident": ident,
+        "at": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
+        "depRwy": pista_salida, "arrRwy": pista_llegada,
+        "wind": viento, "visibility": visibilidad, "clouds": nubes,
+        "qnh": qnh, "trl": nivel_transicion, "remarks": observaciones,
+    })
     try:
         await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATIS), payload)
     except Exception as err:
-        print(f"ERROR al mandar ATIS: {err}")
-        return web.json_response({"error": "discord_failed", "detail": str(err)}, status=502)
-    return web.json_response({"ok": True})
+        await interaction.followup.send(f"No pude publicar el ATIS: {err}", ephemeral=True)
+        return
+    await interaction.followup.send(f"ATIS {aeropuerto.upper()} {ident} publicado. ✅", ephemeral=True)
 
 
 COMANDOS_PUBLICAR = {
@@ -2585,7 +3327,7 @@ def _construir_autorizacion(plan: dict, fuente: str) -> str:
             lineas.append(f"Ascienda y mantenga {nivel}.")
         lineas.append(f"Squawk **{squawk}**.")
 
-    origen = "tu plan de vuelo activo en la web" if fuente == "web" else "tu último mensaje en el canal"
+    origen = "tu plan de vuelo activo (/vuelo)" if fuente == "bot" else "tu último mensaje en el canal"
     lineas.append("")
     lineas.append(f"-# Generado a partir de {origen} — confirmá los datos con control antes de rodar.")
     return "\n".join(lineas)
@@ -2596,11 +3338,11 @@ async def _procesar_autorizacion(message: discord.Message):
     plan, fuente = None, None
 
     try:
-        data = await _consulta_web(f"/api/bot/latest-flight/{autor.id}")
-        if data.get("flight"):
-            plan, fuente = data["flight"], "web"
+        fila = await atc_core.latest_active_flight_for_owner(db, str(autor.id))
+        if fila:
+            plan, fuente = _flight_row_to_op(fila), "bot"
     except Exception as err:
-        print(f"Aviso: no pude consultar el plan real en la web para autorizar: {err}")
+        print(f"Aviso: no pude consultar el plan de vuelo activo para autorizar: {err}")
 
     if plan is None:
         plan = _parsear_plan_de_texto(message.content)
@@ -2609,7 +3351,7 @@ async def _procesar_autorizacion(message: discord.Message):
     try:
         if plan is None:
             await autor.send(
-                "No pude armar una autorización — no tienes un plan de vuelo activo en la web, "
+                "No pude armar una autorización — no tienes un plan de vuelo activo (/vuelo), "
                 "y tu último mensaje tampoco tenía los datos mínimos (indicativo, salida, destino "
                 "y si es IFR o VFR)."
             )
@@ -2755,8 +3497,12 @@ async def on_message(message: discord.Message):
                 "**/academia** — progreso, certificados y cola de evaluaciones\n"
                 "**/apodo** — recalcula tu propio apodo\n"
                 "**/vuelo** — presenta un plan de vuelo\n"
+                "**/vuelo-cerrar** — marca tu plan de vuelo activo como completado\n"
                 "**/atc** — abre una posición de control\n"
+                "**/atc-cerrar** — cierra tu posición ATC abierta\n"
+                "**/atis** — publica un ATIS (solo controladores)\n"
                 "**/servidor** — estado en vivo de la red (vuelos, controladores, verificados)\n"
+                "**/rankings** — top 10 pilotos y controladores por actividad\n"
                 "**/advertencias** — consulta tus advertencias registradas\n"
                 "**/reportar** — abre un ticket privado de soporte"
             ),
@@ -2767,9 +3513,14 @@ async def on_message(message: discord.Message):
             value=(
                 "**/apodo-miembro** — actualiza el apodo de otro miembro\n"
                 "**/advertir** — registra una advertencia formal a un usuario\n"
-                "**/borrar** — borra una cantidad de mensajes recientes del canal\n"
+                "**/timeout** — silencia temporalmente a un usuario\n"
+                "**/kick** — expulsa a un usuario (solo Liderazgo)\n"
+                "**/ban** — banea a un usuario (solo Liderazgo)\n"
+                "**/panel-moderacion** — historial de moderación de un usuario y revocar casos\n"
+                "**/academia-agendar** — agenda una sesión de Academia (categoría, curso, horario, cupo)\n"
+                "**/borrar-mensajes** — borra una cantidad de mensajes recientes del canal\n"
                 "**/panel-soporte** — publica el panel fijo de tickets en un canal\n"
-                "**/eco** — envía un mensaje formal en nombre del bot"
+                "**/anunciar** — publica un anuncio formal en nombre del bot"
             ),
             inline=False,
         )
@@ -2810,10 +3561,14 @@ async def on_message(message: discord.Message):
                 "**/academia** — menú con 4 botones: Mi progreso, Mis certificados, "
                 "Cola de evaluaciones (solo Instructor/Staff), Ascender (solo quien puede ascender)\n"
                 "**/apodo** — recalcula tu apodo (usa nombre real de Roblox vía Bloxlink si está configurado)\n"
-                "**/vuelo** — presenta un plan de vuelo (callsign, aeronave, salida, llegada, nivel, reglas, ruta, alterno, observaciones)\n"
-                "**/atc** — abre una posición ATC (aeropuerto, posición, frecuencia)\n"
-                "**/servidor** — embed con vuelos/controladores/verificados en vivo\n"
-                "**/advertencias [usuario]** — tus advertencias, o las de otro si eres Instructor/Staff\n"
+                "**/vuelo** — presenta un plan de vuelo (callsign, aeronave, salida, llegada, nivel, reglas, ruta, alterno, observaciones); motor propio del bot (SQLite), ya no la web\n"
+                "**/vuelo-cerrar** — marca tu plan de vuelo activo como completado\n"
+                "**/atc** — abre una posición ATC (aeropuerto, posición, frecuencia); crea categoría+canal de voz nativos\n"
+                "**/atc-cerrar** — cierra tu posición ATC (o se cierra sola si el canal de voz queda vacío)\n"
+                "**/servidor** — embed con vuelos/controladores/verificados en vivo (desde el motor propio)\n"
+                "**/rankings** — top 10 pilotos y controladores por actividad completada\n"
+                "**/atis** — publica un ATIS (aeropuerto, ident, pista, viento, etc.) — rol ATC\n"
+                "**/advertencias [usuario]** — tu historial de moderación, o el de otro si eres Instructor/Staff\n"
                 "**/reportar** — abre modal → crea ticket privado"
             ),
             inline=False,
@@ -2822,10 +3577,15 @@ async def on_message(message: discord.Message):
             name="Slash — Instructores/Staff (ocultos del selector \"/\" para todos los demás)",
             value=(
                 "**/apodo-miembro** — recalcula el apodo de otro miembro\n"
-                "**/advertir** — registra advertencia (web + canal de log + MD embed al usuario)\n"
-                "**/borrar** — purga de 1 a 100 mensajes del canal\n"
+                "**/advertir** — registra un caso de advertencia (SQLite propia + canal de log + MD embed al usuario)\n"
+                "**/timeout** — silencia temporalmente (timeout nativo de Discord), registra caso\n"
+                "**/kick** — expulsa a un usuario (solo Liderazgo), registra caso\n"
+                "**/ban** — banea a un usuario (solo Liderazgo), registra caso\n"
+                "**/panel-moderacion** — panel con historial de casos de un usuario + select para revocar\n"
+                "**/academia-agendar** — agenda una sesión de Academia (categoría, curso, en_minutos, cupo)\n"
+                "**/borrar-mensajes** — purga de 1 a 100 mensajes del canal\n"
                 "**/panel-soporte** — publica el panel fijo de tickets (botón persistente)\n"
-                "**/eco** — modal de texto largo → lo publica el bot (canal, MD, o mismo canal)"
+                "**/anunciar** — modal de texto largo → lo publica el bot (canal, MD, o mismo canal)"
             ),
             inline=False,
         )
@@ -2950,6 +3710,15 @@ async def on_interaction(interaction: discord.Interaction):
 
     if custom_id == SOLICITAR_CONTROL_CUSTOM_ID:
         await _procesar_solicitud_control(interaction)
+        return
+
+    if custom_id == SOLICITAR_SESION_CUSTOM_ID:
+        await _procesar_solicitud_sesion(interaction)
+        return
+
+    if custom_id and custom_id.startswith("academy_session:"):
+        _, accion, session_uuid = custom_id.split(":", 2)
+        await _procesar_boton_sesion(interaction, accion, session_uuid)
         return
 
     if custom_id in (ENCUESTA_CONTROL_CUSTOM_SI, ENCUESTA_CONTROL_CUSTOM_NO):
