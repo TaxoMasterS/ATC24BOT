@@ -10,7 +10,7 @@ evaluaciones/inscripción/aprobar-rechazar quedan operativos desde Discord.
 El armado de cursos/lecciones/exámenes (antes un editor en la web) y la
 vista de "tomar una lección/examen" quedan FUERA de esta fase — son una
 pieza de UI grande en sí misma (contenido enriquecido + examen cronometrado)
-que merece su propio diseño dedicado, no un apéndice apurado acá.
+que merece su propio diseño dedicado, no un apéndice apurado aquí.
 """
 
 from __future__ import annotations
@@ -129,6 +129,37 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
         """
     )
     await conn.commit()
+    # Bloque D2: código corto de verificación de autenticidad, agregado
+    # después del esquema original — mismo patrón de migración incremental
+    # que atc_core.py (ALTER TABLE, se ignora si ya existe).
+    try:
+        await conn.execute("ALTER TABLE academy_certificates ADD COLUMN verify_code TEXT")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass
+    # Rediseño de certificados: quién lo emitió (instructor que aprobó la
+    # evaluación) y su estado (VALIDO/REVOCADO) — un código revocado sigue
+    # existiendo en la tabla, nunca se borra ni se reutiliza.
+    try:
+        await conn.execute("ALTER TABLE academy_certificates ADD COLUMN instructor_id TEXT")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass
+    try:
+        await conn.execute("ALTER TABLE academy_certificates ADD COLUMN status TEXT NOT NULL DEFAULT 'VALIDO'")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass
+    try:
+        await conn.execute("ALTER TABLE academy_certificates ADD COLUMN revoked_by TEXT")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass
+    try:
+        await conn.execute("ALTER TABLE academy_certificates ADD COLUMN revoked_at INTEGER")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass
 
 
 async def has_courses(conn: aiosqlite.Connection) -> bool:
@@ -300,7 +331,7 @@ async def resolve_evaluation(conn: aiosqlite.Connection, user_id: str, course_uu
         conn, user_id, course_uuid, state="completed", eval_state="approved",
         approved_by=approver_id, approved_at=_now_ms(),
     )
-    await _grant_certificate_if_missing(conn, user_id, course_uuid, "final")
+    certificado = await _grant_certificate_if_missing(conn, user_id, course_uuid, "final", instructor_id=approver_id)
 
     cur2 = await conn.execute("SELECT * FROM academy_courses WHERE uuid = ?", (course_uuid,))
     curso = await cur2.fetchone()
@@ -312,22 +343,90 @@ async def resolve_evaluation(conn: aiosqlite.Connection, user_id: str, course_uu
         siguiente = await cur3.fetchone()
         if siguiente:
             await _upsert_course_progress(conn, user_id, siguiente["uuid"], state="in_progress", eval_state="locked")
-    return {"approved": True, "courseTitle": curso["title"] if curso else None}
+    return {
+        "approved": True, "courseTitle": curso["title"] if curso else None,
+        "branch": curso["branch"] if curso else None,
+        "certificateCode": certificado["verify_code"] if certificado else None,
+        "instructorId": approver_id,
+    }
 
 
-async def _grant_certificate_if_missing(conn: aiosqlite.Connection, user_id: str, course_uuid: str, tipo: str) -> None:
+# Códigos de certificado — 6 caracteres alfanuméricos, A-Z y 2-9, excluyendo
+# 0/1/I/O (se confunden entre sí o con letras parecidas). Generado al azar y
+# comprobado contra la tabla hasta encontrar uno libre — un código nunca se
+# reutiliza, ni siquiera si el certificado que lo tenía se revoca (queda en
+# la tabla con status='REVOCADO' en vez de borrarse).
+_CODIGO_ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_CODIGO_LARGO = 6
+
+
+async def _generar_codigo_unico(conn: aiosqlite.Connection) -> str:
+    import secrets
+    while True:
+        codigo = "".join(secrets.choice(_CODIGO_ALFABETO) for _ in range(_CODIGO_LARGO))
+        cur = await conn.execute("SELECT 1 FROM academy_certificates WHERE verify_code = ?", (codigo,))
+        if not await cur.fetchone():
+            return codigo
+
+
+async def _grant_certificate_if_missing(conn: aiosqlite.Connection, user_id: str, course_uuid: str, tipo: str,
+                                         instructor_id: str | None = None) -> dict | None:
+    """Devuelve la fila del certificado (nueva o ya existente) — Bloque D2
+    necesita el verify_code para generar la imagen, no solo saber si ya
+    existía."""
     cur = await conn.execute(
-        "SELECT 1 FROM academy_certificates WHERE user_id = ? AND course_uuid = ? AND type = ?",
+        "SELECT * FROM academy_certificates WHERE user_id = ? AND course_uuid = ? AND type = ?",
         (user_id, course_uuid, tipo),
     )
-    if await cur.fetchone():
-        return
+    existente = await cur.fetchone()
+    if existente:
+        return dict(existente)
     import uuid as _uuid
+    row_uuid = str(_uuid.uuid4())
+    now = _now_ms()
+    codigo = await _generar_codigo_unico(conn)
     await conn.execute(
-        "INSERT INTO academy_certificates (uuid, user_id, course_uuid, type, issued_at) VALUES (?, ?, ?, ?, ?)",
-        (str(_uuid.uuid4()), user_id, course_uuid, tipo, _now_ms()),
+        """INSERT INTO academy_certificates (uuid, user_id, course_uuid, type, issued_at, verify_code, instructor_id, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'VALIDO')""",
+        (row_uuid, user_id, course_uuid, tipo, now, codigo, instructor_id),
     )
     await conn.commit()
+    cur2 = await conn.execute("SELECT * FROM academy_certificates WHERE uuid = ?", (row_uuid,))
+    return dict(await cur2.fetchone())
+
+
+async def get_certificate_by_code(conn: aiosqlite.Connection, code: str) -> dict | None:
+    cur = await conn.execute(
+        """SELECT cert.*, c.title AS course_title, c.branch AS branch, c.code AS course_code
+           FROM academy_certificates cert
+           JOIN academy_courses c ON c.uuid = cert.course_uuid
+           WHERE cert.verify_code = ?""",
+        (code.strip().upper(),),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def revoke_certificate(conn: aiosqlite.Connection, code: str, revoked_by: str) -> dict | None:
+    """Revoca un certificado por su código — el registro queda (nunca se
+    borra), solo cambia de estado. Devuelve None si el código no existe o
+    ya estaba revocado."""
+    cert = await get_certificate_by_code(conn, code)
+    if not cert or cert["status"] == "REVOCADO":
+        return None
+    await conn.execute(
+        "UPDATE academy_certificates SET status = 'REVOCADO', revoked_by = ?, revoked_at = ? WHERE uuid = ?",
+        (revoked_by, _now_ms(), cert["uuid"]),
+    )
+    await conn.commit()
+    return await get_certificate_by_code(conn, code)
+
+
+def compact_record(cert: dict) -> str:
+    """Registro compacto tipo "7K4X9P|S1|V" — ID de código, código del curso
+    (rango) y V/R según esté vigente o revocado."""
+    estado = "V" if cert.get("status", "VALIDO") == "VALIDO" else "R"
+    return f"{cert['verify_code']}|{cert.get('course_code') or '?'}|{estado}"
 
 
 async def has_final_certificate(conn: aiosqlite.Connection, user_id: str, branch: str) -> bool:

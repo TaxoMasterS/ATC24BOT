@@ -2,7 +2,7 @@
 alumnos se anotan de antemano, y al llegar la hora se publica un panel en
 vivo con inscripción abierta (Unirse/Salir/Ver alumnos).
 
-No está ligado 1:1 al catálogo de cursos (academy_core) a propósito: acá
+No está ligado 1:1 al catálogo de cursos (academy_core) a propósito: aquí
 "curso"/"categoría" son texto libre que pone el instructor al agendar (igual
 que el sistema de referencia), no necesariamente un academy_courses.uuid —
 mantiene el agendado simple sin forzar que cada sesión mapee a un curso
@@ -96,6 +96,28 @@ async def set_live(conn: aiosqlite.Connection, session_uuid: str, channel_id: st
         (channel_id, message_id, _now_ms(), session_uuid),
     )
     await conn.commit()
+
+
+async def reschedule(conn: aiosqlite.Connection, session_uuid: str, new_scheduled_at_ms: int) -> dict | None:
+    """Bloque D1: atrasar/adelantar una clase agendada — solo tiene sentido
+    mientras sigue en estado 'scheduled' (todavía no se publicó el anuncio en vivo)."""
+    fila = await get_session(conn, session_uuid)
+    if not fila or fila["state"] != SCHEDULED:
+        return None
+    await conn.execute(
+        "UPDATE academy_sessions SET scheduled_at = ?, updated_at = ? WHERE uuid = ?",
+        (new_scheduled_at_ms, _now_ms(), session_uuid),
+    )
+    await conn.commit()
+    return await get_session(conn, session_uuid)
+
+
+async def sessions_by_instructor(conn: aiosqlite.Connection, instructor_id: str) -> list[dict]:
+    cur = await conn.execute(
+        "SELECT * FROM academy_sessions WHERE instructor_id = ? AND state IN ('scheduled', 'live') ORDER BY scheduled_at ASC",
+        (instructor_id,),
+    )
+    return [dict(r) for r in await cur.fetchall()]
 
 
 async def set_state(conn: aiosqlite.Connection, session_uuid: str, state: str) -> None:
