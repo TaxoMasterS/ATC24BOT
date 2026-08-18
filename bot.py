@@ -4219,31 +4219,51 @@ _sesiones_lock = asyncio.Lock()
 _ultima_solicitud_sesion = {}  # discord_id -> timestamp de asyncio loop
 
 
-def _construir_payload_sesiones_agendadas(sesiones: list):
-    if not sesiones:
-        cuerpo = "_No hay sesiones agendadas por ahora. Un instructor puede agendar una desde `/academia`._"
-    else:
-        por_categoria: dict = {}
-        orden = []
-        for s in sesiones:
-            cat = s["category"]
-            if cat not in por_categoria:
-                por_categoria[cat] = []
-                orden.append(cat)
-            por_categoria[cat].append(s)
-        bloques = []
-        for cat in orden:
-            filas = [f"**{cat}**"]
-            for s in por_categoria[cat]:
+def _agrupar_sesiones_por_categoria(sesiones: list, *, en_vivo: bool) -> list:
+    """Arma los bloques de texto de un grupo de sesiones (agendadas o en
+    vivo), agrupadas por categoría — mismo formato para las dos, solo cambia
+    si la línea de tiempo dice "empieza" (agendada) o "en curso desde"
+    (en vivo)."""
+    por_categoria: dict = {}
+    orden = []
+    for s in sesiones:
+        cat = s["category"]
+        if cat not in por_categoria:
+            por_categoria[cat] = []
+            orden.append(cat)
+        por_categoria[cat].append(s)
+    bloques = []
+    for cat in orden:
+        filas = [f"**{cat}**"]
+        for s in por_categoria[cat]:
+            cupo_max = s["max_students"] if s["max_students"] is not None else 10
+            titulo = f"`Clase {s['course_title']}`"
+            if s.get("channel_id") and s.get("message_id"):
+                url = f"https://discord.com/channels/{GUILD_ID}/{s['channel_id']}/{s['message_id']}"
+                titulo = f"[Clase {s['course_title']}]({url})"
+            if en_vivo:
+                ts = int((s.get("live_since") or s["scheduled_at"]) / 1000)
+                marca = f"🔴 en vivo desde <t:{ts}:R>"
+            else:
                 ts = int(s["scheduled_at"] / 1000)
-                cupo_max = s["max_students"] if s["max_students"] is not None else 10
-                titulo = f"`Clase {s['course_title']}`"
-                if s.get("channel_id") and s.get("message_id"):
-                    url = f"https://discord.com/channels/{GUILD_ID}/{s['channel_id']}/{s['message_id']}"
-                    titulo = f"[Clase {s['course_title']}]({url})"
-                filas.append(f"{titulo} ({s['_inscritos']}/{cupo_max}) — <t:{ts}:R> — <@{s['instructor_id']}>")
-            bloques.append("\n".join(filas))
-        cuerpo = "\n\n".join(bloques)
+                marca = f"empieza <t:{ts}:R>"
+            filas.append(f"{titulo} ({s['_inscritos']}/{cupo_max}) — {marca} — <@{s['instructor_id']}>")
+        bloques.append("\n".join(filas))
+    return bloques
+
+
+def _construir_payload_sesiones_agendadas(sesiones: list, en_vivo: list | None = None):
+    en_vivo = en_vivo or []
+    secciones = []
+    if en_vivo:
+        secciones.append("### 🔴 En vivo ahora\n" + "\n\n".join(_agrupar_sesiones_por_categoria(en_vivo, en_vivo=True)))
+    if sesiones:
+        agendadas_txt = "\n\n".join(_agrupar_sesiones_por_categoria(sesiones, en_vivo=False))
+        secciones.append(f"### 🗓️ Agendadas\n{agendadas_txt}" if en_vivo else agendadas_txt)
+    if not secciones:
+        cuerpo = "_No hay sesiones agendadas ni en vivo por ahora. Un instructor puede agendar una desde `/academia`._"
+    else:
+        cuerpo = "\n\n".join(secciones)
     return {
         "flags": 32768,
         "allowed_mentions": {"parse": []},
@@ -4251,7 +4271,7 @@ def _construir_payload_sesiones_agendadas(sesiones: list):
             {
                 "type": 17, "accent_color": BRAND_BEACON_AMBER,
                 "components": [
-                    {"type": 10, "content": f"{E['libro']} **ATC24 Español — Sesiones de Academia agendadas**"},
+                    {"type": 10, "content": f"{E['libro']} **ATC24 Español — Sesiones de Academia**"},
                     {"type": 14, "divider": True, "spacing": 1},
                     {"type": 10, "content": cuerpo},
                     {
@@ -4275,9 +4295,10 @@ async def _repostear_sesiones_agendadas():
         return
     async with _sesiones_lock:
         sesiones = await sessions_core.upcoming_sessions(db)
-        for s in sesiones:
+        en_vivo = await sessions_core.live_sessions(db)
+        for s in sesiones + en_vivo:
             s["_inscritos"] = await sessions_core.count_signups(db, s["uuid"])
-        payload = _construir_payload_sesiones_agendadas(sesiones)
+        payload = _construir_payload_sesiones_agendadas(sesiones, en_vivo)
         headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
 
         if _sesiones_message_id:
@@ -4447,15 +4468,32 @@ async def _procesar_solicitud_sesion(interaction: discord.Interaction):
     await interaction.response.send_message("Elige el rating para tu sesión:", view=RatingSelectView(), ephemeral=True)
 
 
+def _barra_cupo(inscritos: int, maximo: int | None, *, largo: int = 10) -> str:
+    """Barra de texto simple — se normaliza a `largo` segmentos sin importar
+    el cupo real (una clase de 200 no tendría sentido dibujada literalmente
+    con 200 bloques)."""
+    if not maximo or maximo <= 0:
+        return "█" * min(inscritos, largo)
+    llenos = min(largo, round((inscritos / maximo) * largo))
+    return "█" * llenos + "░" * (largo - llenos)
+
+
 def _construir_payload_sesion_en_vivo(sesion: dict, inscritos: int):
-    ts = int(sesion["scheduled_at"] / 1000)
-    cupo = f"{inscritos}/{sesion['max_students']}" if sesion["max_students"] is not None else str(inscritos)
+    # live_since es lo correcto acá (cuándo arrancó de verdad) — scheduled_at
+    # es solo referencia de fallback para filas viejas de antes de esta
+    # migración. <t:...:R> lo actualiza Discord solo del lado del cliente,
+    # así que "tiempo transcurrido" queda siempre al día sin que el bot
+    # tenga que re-editar el mensaje solo para eso.
+    ts_inicio = int((sesion.get("live_since") or sesion["scheduled_at"]) / 1000)
+    maximo = sesion.get("max_students")
+    cupo = f"{inscritos}/{maximo}" if maximo is not None else str(inscritos)
+    barra = _barra_cupo(inscritos, maximo)
     lineas = [
         f"**{sesion['course_title']}: en curso**",
         "",
         f"<@{sesion['instructor_id']}> está dando una sesión de **{sesion['course_title']}** "
-        f"(agendada <t:{ts}:R>) enfocada en **{sesion['category']}**. "
-        f"Hay actualmente **{cupo}** alumno(s) anotados. Usa **Ver alumnos** para ver quién está anotado.",
+        f"enfocada en **{sesion['category']}** — en curso desde <t:{ts_inicio}:R>.",
+        f"`{barra}` **{cupo}** alumno(s) anotados. Usa **Ver alumnos** para ver quién está anotado.",
     ]
     componentes_container = []
     # El nombre se elige con el uuid de la sesión como semilla — así una
@@ -4509,26 +4547,35 @@ async def _publicar_sesion_en_vivo(sesion: dict):
 
 
 async def _actualizar_mensaje_sesion_en_vivo(sesion: dict):
-    if not sesion.get("channel_id") or not sesion.get("message_id"):
-        return
-    inscritos = await sessions_core.count_signups(db, sesion["uuid"])
-    # El banner no se vuelve a subir acá — se recalcula el mismo nombre de
-    # archivo (misma semilla) y se referencia otra vez, dejando el adjunto
-    # que ya está en el mensaje sin tocar (el PATCH no manda "attachments",
-    # así que Discord no lo borra).
-    payload, _nombre_banner = _construir_payload_sesion_en_vivo(sesion, inscritos)
-    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-    status, data, texto = await _discord_request(
-        "PATCH", f"https://discord.com/api/v10/channels/{sesion['channel_id']}/messages/{sesion['message_id']}",
-        headers=headers, json_body=payload,
-    )
-    if status >= 300 and status != 404:
-        print(f"Aviso: no pude actualizar el panel de la sesión en vivo {sesion['uuid']}: {status} {texto or data}")
+    # Nunca deja pasar una excepción — se llama DESPUÉS de que ya se le
+    # mandó la confirmación efímera a quien se anotó/salió, así que si esto
+    # revienta sin capturarlo, la persona ve "listo ✅" pero el panel nunca
+    # cambia y no queda ningún rastro visible del motivo.
+    try:
+        if not sesion.get("channel_id") or not sesion.get("message_id"):
+            return
+        inscritos = await sessions_core.count_signups(db, sesion["uuid"])
+        # El banner no se vuelve a subir acá — se recalcula el mismo nombre
+        # de archivo (misma semilla) y se referencia otra vez, dejando el
+        # adjunto que ya está en el mensaje sin tocar (el PATCH no manda
+        # "attachments", así que Discord no lo borra — confirmado a mano
+        # contra la API real).
+        payload, _nombre_banner = _construir_payload_sesion_en_vivo(sesion, inscritos)
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+        status, data, texto = await _discord_request(
+            "PATCH", f"https://discord.com/api/v10/channels/{sesion['channel_id']}/messages/{sesion['message_id']}",
+            headers=headers, json_body=payload,
+        )
+        if status >= 300 and status != 404:
+            print(f"Aviso: no pude actualizar el panel de la sesión en vivo {sesion['uuid']}: {status} {texto or data}")
+    except Exception as err:
+        print(f"ERROR al actualizar el panel de la sesión en vivo {sesion.get('uuid')}: {err!r}")
 
 
 async def _sesiones_academia_loop():
     while True:
         await asyncio.sleep(60)
+
         try:
             vencidas = await sessions_core.due_sessions(db)
             for s in vencidas:
@@ -4536,7 +4583,43 @@ async def _sesiones_academia_loop():
             if vencidas:
                 await _repostear_sesiones_agendadas()
         except Exception as err:
-            print(f"Aviso: fallo en el loop de sesiones de Academia: {err}")
+            print(f"Aviso: fallo al publicar sesiones que llegaron a su hora: {err}")
+
+        try:
+            # Recordatorio a inscritos — 10 min antes de que arranque una
+            # sesión que todavía está agendada (no en vivo).
+            for s in await sessions_core.sesiones_para_recordar(db):
+                await sessions_core.marcar_recordatorio_enviado(db, s["uuid"])
+                ts = int(s["scheduled_at"] / 1000)
+                for user_id in await sessions_core.list_signups(db, s["uuid"]):
+                    try:
+                        usuario = await client.fetch_user(int(user_id))
+                        await usuario.send(
+                            f"Recordatorio: tu sesión de **{s['course_title']}** empieza <t:{ts}:R>. ✈️"
+                        )
+                    except (discord.Forbidden, discord.NotFound):
+                        pass
+        except Exception as err:
+            print(f"Aviso: fallo al mandar recordatorios de sesiones: {err}")
+
+        try:
+            # Auto-cierre por inactividad — red de seguridad para cuando el
+            # instructor se olvida de cerrar la sesión (ver
+            # sessions_core.AUTO_CIERRE_INACTIVIDAD_MIN).
+            for s in await sessions_core.sesiones_para_autocerrar(db):
+                await sessions_core.set_state(db, s["uuid"], sessions_core.COMPLETED)
+                await _cerrar_mensaje_sesion_en_vivo(s)
+                try:
+                    instructor = await client.fetch_user(int(s["instructor_id"]))
+                    await instructor.send(
+                        f"Tu sesión de **{s['course_title']}** se cerró sola por "
+                        f"{sessions_core.AUTO_CIERRE_INACTIVIDAD_MIN} minutos sin actividad."
+                    )
+                except (discord.Forbidden, discord.NotFound):
+                    pass
+                await _repostear_sesiones_agendadas()
+        except Exception as err:
+            print(f"Aviso: fallo al auto-cerrar sesiones inactivas: {err}")
 
 
 async def _procesar_boton_sesion(interaction: discord.Interaction, accion: str, session_uuid: str):
@@ -4554,6 +4637,7 @@ async def _procesar_boton_sesion(interaction: discord.Interaction, accion: str, 
             await interaction.response.send_message("Esta sesión ya no tiene cupo disponible.", ephemeral=True)
             return
         await interaction.response.send_message(f"Te anotaste a **{sesion['course_title']}**. ✅", ephemeral=True)
+        await sessions_core.marcar_actividad(db, session_uuid)
         await _actualizar_mensaje_sesion_en_vivo(await sessions_core.get_session(db, session_uuid))
         try:
             await interaction.user.send(f"Confirmado: te anotaste a la sesión de **{sesion['course_title']}**. ✅")
@@ -4566,6 +4650,7 @@ async def _procesar_boton_sesion(interaction: discord.Interaction, accion: str, 
             await interaction.response.send_message("No estabas anotado en esta sesión.", ephemeral=True)
             return
         await interaction.response.send_message("Saliste de la sesión.", ephemeral=True)
+        await sessions_core.marcar_actividad(db, session_uuid)
         await _actualizar_mensaje_sesion_en_vivo(await sessions_core.get_session(db, session_uuid))
         try:
             await interaction.user.send(f"Confirmado: saliste de la sesión de **{sesion['course_title']}**.")

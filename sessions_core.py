@@ -52,6 +52,19 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
         """
     )
     await conn.commit()
+    # Calidad de vida (auto-cierre por inactividad + recordatorio a
+    # inscritos) — agregado después del esquema original, mismo patrón de
+    # migración incremental que el resto de los módulos del bot.
+    for columna, tipo in [
+        ("live_since", "INTEGER"),        # cuándo pasó a 'live' — separado de updated_at porque las inscripciones también lo tocan
+        ("last_activity_at", "INTEGER"),  # último join/leave — para el auto-cierre por inactividad
+        ("reminder_sent_at", "INTEGER"),  # evita mandar el recordatorio más de una vez
+    ]:
+        try:
+            await conn.execute(f"ALTER TABLE academy_sessions ADD COLUMN {columna} {tipo}")
+            await conn.commit()
+        except aiosqlite.OperationalError:
+            pass
 
 
 async def create_session(conn: aiosqlite.Connection, *, category: str, course_title: str,
@@ -91,9 +104,66 @@ async def due_sessions(conn: aiosqlite.Connection) -> list[dict]:
 
 
 async def set_live(conn: aiosqlite.Connection, session_uuid: str, channel_id: str, message_id: str) -> None:
+    now = _now_ms()
     await conn.execute(
-        "UPDATE academy_sessions SET state = 'live', channel_id = ?, message_id = ?, updated_at = ? WHERE uuid = ?",
-        (channel_id, message_id, _now_ms(), session_uuid),
+        """UPDATE academy_sessions SET state = 'live', channel_id = ?, message_id = ?,
+           live_since = ?, last_activity_at = ?, updated_at = ? WHERE uuid = ?""",
+        (channel_id, message_id, now, now, now, session_uuid),
+    )
+    await conn.commit()
+
+
+async def live_sessions(conn: aiosqlite.Connection) -> list[dict]:
+    cur = await conn.execute("SELECT * FROM academy_sessions WHERE state = 'live' ORDER BY live_since ASC")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def marcar_actividad(conn: aiosqlite.Connection, session_uuid: str) -> None:
+    """Se llama en cada Unirse/Salir — resetea el reloj del auto-cierre por
+    inactividad (mismo patrón que _cerrar_atc_por_inactividad)."""
+    await conn.execute(
+        "UPDATE academy_sessions SET last_activity_at = ? WHERE uuid = ?", (_now_ms(), session_uuid)
+    )
+    await conn.commit()
+
+
+# Una clase en vivo se cierra sola si nadie (ni el instructor, ni un alumno
+# uniéndose/saliendo) generó actividad en este tiempo — pensado como red de
+# seguridad para cuando el instructor se olvida de cerrarla, no como límite
+# normal de duración de una clase.
+AUTO_CIERRE_INACTIVIDAD_MIN = 180
+
+
+async def sesiones_para_autocerrar(conn: aiosqlite.Connection) -> list[dict]:
+    limite = _now_ms() - AUTO_CIERRE_INACTIVIDAD_MIN * 60_000
+    cur = await conn.execute(
+        "SELECT * FROM academy_sessions WHERE state = 'live' AND COALESCE(last_activity_at, live_since) < ?",
+        (limite,),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+# Recordatorio a inscritos: se manda una sola vez, entre este umbral y el
+# instante en que la sesión pasa a 'live' (el loop corre cada 60s, así que
+# una ventana de 5 min asegura que no se salte el aviso entre una vuelta y
+# la otra).
+RECORDATORIO_ANTES_MIN = 10
+
+
+async def sesiones_para_recordar(conn: aiosqlite.Connection) -> list[dict]:
+    ahora = _now_ms()
+    umbral = ahora + RECORDATORIO_ANTES_MIN * 60_000
+    cur = await conn.execute(
+        """SELECT * FROM academy_sessions
+           WHERE state = 'scheduled' AND scheduled_at <= ? AND scheduled_at > ? AND reminder_sent_at IS NULL""",
+        (umbral, ahora),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def marcar_recordatorio_enviado(conn: aiosqlite.Connection, session_uuid: str) -> None:
+    await conn.execute(
+        "UPDATE academy_sessions SET reminder_sent_at = ? WHERE uuid = ?", (_now_ms(), session_uuid)
     )
     await conn.commit()
 
