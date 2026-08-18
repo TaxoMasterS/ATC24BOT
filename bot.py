@@ -926,6 +926,78 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         "imagen_url": imagen_url,
     })
     _guardar_json("foto_semana.json", _estado_foto_semana)
+    try:
+        await _actualizar_panel_nominadas_foto_semana()
+    except Exception as err:
+        print(f"Aviso: no pude actualizar el panel de nominadas de foto de la semana: {err}")
+
+
+def _construir_payload_nominadas_foto_semana(nominadas: list) -> dict:
+    """Panel fijo que se edita in-place cada vez que se nomina una foto
+    nueva — muestra la lista numerada con el link al mensaje original y una
+    galería con todas las imágenes nominadas, para que se vea de un vistazo
+    quién nominó qué sin tener que ir a buscar cada mensaje."""
+    if not nominadas:
+        cuerpo = "_Todavía no hay ninguna foto nominada esta semana. Reacciona con ⭐ a una foto para nominarla._"
+    else:
+        lineas = [
+            f"**{i}.** [{('Ver foto')}]({n['jump_url']}) — <@{n['author_id']}>"
+            for i, n in enumerate(nominadas, start=1)
+        ]
+        cuerpo = "\n".join(lineas)
+        if len(nominadas) < 3:
+            faltan = 3 - len(nominadas)
+            cuerpo += f"\n\n_Hacen falta {_plural(faltan, 'nominada más', 'nominadas más')} para abrir la votación el viernes._"
+
+    componentes = [
+        {"type": 10, "content": "# ⭐ Nominadas de la semana"},
+        {"type": 14, "divider": True, "spacing": 1},
+        {"type": 10, "content": cuerpo},
+    ]
+    if nominadas:
+        # Media Gallery admite hasta 10 items — con más de 10 nominadas se
+        # muestran las primeras 10 imágenes, pero la lista de texto de
+        # arriba sigue completa.
+        items = [{"media": {"url": n["imagen_url"]}} for n in nominadas[:10]]
+        componentes.append({"type": 12, "items": items})
+
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [{"type": 17, "accent_color": BRAND_BEACON_AMBER, "components": componentes}],
+    }
+
+
+async def _actualizar_panel_nominadas_foto_semana() -> None:
+    """Publica o edita el panel fijo de nominadas — no hace falta que sea el
+    último mensaje del canal (a diferencia de la tabla ATC), así que editar
+    in-place alcanza."""
+    if not DISCORD_CHANNEL_FOTO_SEMANA:
+        return
+    payload = _construir_payload_nominadas_foto_semana(_estado_foto_semana["nominadas"])
+    message_id = await bot_state.get(db, "foto_semana_nominadas_message_id")
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+
+    if message_id:
+        status, data, texto = await _discord_request(
+            "PATCH", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FOTO_SEMANA}/messages/{message_id}",
+            headers=headers, json_body=payload,
+        )
+        if status < 300:
+            return
+        if status != 404:
+            print(f"Aviso: no pude editar el panel de nominadas de foto de la semana: {status} {texto or data}")
+            return
+        await bot_state.set(db, "foto_semana_nominadas_message_id", None)  # lo borraron a mano
+
+    status, data, texto = await _discord_request(
+        "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FOTO_SEMANA}/messages",
+        headers=headers, json_body=payload,
+    )
+    if status >= 300:
+        print(f"Aviso: no pude publicar el panel de nominadas de foto de la semana: {status} {texto or data}")
+        return
+    await bot_state.set(db, "foto_semana_nominadas_message_id", data["id"])
 
 
 def _construir_payload_votacion_foto_semana(opciones: list) -> dict:
@@ -992,6 +1064,10 @@ async def _abrir_votacion_foto_semana():
     _estado_foto_semana["nominadas"] = []
     _estado_foto_semana["votacion"] = {"message_id": mensaje["id"], "opciones": opciones, "votos": {}}
     _guardar_json("foto_semana.json", _estado_foto_semana)
+    try:
+        await _actualizar_panel_nominadas_foto_semana()  # queda en "sin nominadas" para la semana nueva
+    except Exception as err:
+        print(f"Aviso: no pude limpiar el panel de nominadas tras abrir la votación: {err}")
 
 
 async def _procesar_voto_foto_semana(interaction: discord.Interaction, message_id_opcion: str):
@@ -1160,6 +1236,40 @@ async def _reconciliar_paneles_permanentes_al_arrancar():
     )
     if _sesiones_message_id:
         print(f"Sesiones agendadas: retomo el panel existente ({_sesiones_message_id}) tras el reinicio.")
+
+    # Con el message_id ya reconciliado (o limpiado si no existía más), se
+    # fuerza un refresco real de contenido — así los paneles quedan al día
+    # apenas el bot vuelve a estar arriba, en vez de esperar al próximo
+    # trigger natural (un mensaje nuevo en el canal, una inscripción, etc.).
+    for nombre in await _refrescar_dashboards_en_vivo():
+        print(f"Dashboard refrescado al arrancar: {nombre}")
+
+
+async def _refrescar_dashboards_en_vivo() -> list[str]:
+    """Republica/edita los paneles que siempre deben reflejar el estado
+    actual: tabla de ATC, sesiones de Academia, nominadas de Foto de la
+    Semana. NO incluye paneles de un solo uso con botones persistentes
+    (Dashboard de Staff, panel de tickets, verificación) — esos se publican
+    a mano con su comando ("!staff", "!panel-soporte", etc.) y sus botones
+    ya funcionan solos tras un reinicio gracias a client.add_view en
+    setup_hook; volver a mandarlos automáticamente solo dejaría duplicados."""
+    refrescados = []
+    try:
+        await _repostear_tabla_atc(await _activos_para_tabla())
+        refrescados.append("Tabla de controladores ATC")
+    except Exception as err:
+        print(f"Aviso: no pude refrescar la tabla ATC: {err}")
+    try:
+        await _repostear_sesiones_agendadas()
+        refrescados.append("Sesiones de Academia")
+    except Exception as err:
+        print(f"Aviso: no pude refrescar el panel de sesiones de Academia: {err}")
+    try:
+        await _actualizar_panel_nominadas_foto_semana()
+        refrescados.append("Nominadas de Foto de la Semana")
+    except Exception as err:
+        print(f"Aviso: no pude refrescar el panel de nominadas de Foto de la Semana: {err}")
+    return refrescados
 
 
 async def _mantenimiento_atc_loop():
@@ -1864,8 +1974,29 @@ class EvaluacionModal1(discord.ui.Modal, title="Calificar (1/2)"):
                 await interaction.response.send_message(f"Puntaje inválido en \"{campo.label}\" — debe ser un número de 1 a 10.", ephemeral=True)
                 return
             puntajes.append(int(valor))
+        # Discord no deja abrir un modal como respuesta a OTRO modal (solo
+        # como respuesta a un botón/select o a un slash command) — hay que
+        # pasar por un botón intermedio, que sí puede abrir el segundo.
+        await interaction.response.send_message(
+            "Primeros 5 criterios guardados. Presiona el botón para calificar los últimos 5.",
+            view=ContinuarEvaluacionView(self.user_id, self.course_uuid, self.curso_titulo, self.criterios, puntajes),
+            ephemeral=True,
+        )
+
+
+class ContinuarEvaluacionView(discord.ui.View):
+    def __init__(self, user_id: str, course_uuid: str, curso_titulo: str, criterios: list, puntajes_1a5: list):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.course_uuid = course_uuid
+        self.curso_titulo = curso_titulo
+        self.criterios = criterios
+        self.puntajes_1a5 = puntajes_1a5
+
+    @discord.ui.button(label="Continuar calificación (2/2)", style=discord.ButtonStyle.primary, emoji="📝")
+    async def continuar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(
-            EvaluacionModal2(self.user_id, self.course_uuid, self.curso_titulo, self.criterios, puntajes)
+            EvaluacionModal2(self.user_id, self.course_uuid, self.curso_titulo, self.criterios, self.puntajes_1a5)
         )
 
 
@@ -1966,10 +2097,20 @@ class AscenderInicioView(discord.ui.View):
 
 
 class AgendarSesionModal(discord.ui.Modal, title="Agendar sesión de Academia"):
-    categoria = discord.ui.TextInput(label="Categoría/tema (ej. Basic Operations Theory)", max_length=100)
-    curso = discord.ui.TextInput(label="Nombre del curso/sesión (ej. RPL Course)", max_length=100)
-    en_minutos = discord.ui.TextInput(label="En cuántos minutos empieza", max_length=6, placeholder="ej. 60")
-    cupo = discord.ui.TextInput(label="Cupo máximo de alumnos", required=False, default="10", max_length=3)
+    categoria = discord.ui.TextInput(
+        label="Rama de formación", placeholder="Ej. PPA, PCA, ATC, Equipo de Tierra", max_length=100,
+    )
+    curso = discord.ui.TextInput(
+        label="Tema de la sesión",
+        placeholder="Ej. Operaciones Básicas, Plan de Vuelo, Fraseología, IFR, SID/STAR",
+        max_length=100,
+    )
+    en_minutos = discord.ui.TextInput(
+        label="Inicio de la sesión (minutos desde ahora)", placeholder="Ej. 60", max_length=6,
+    )
+    cupo = discord.ui.TextInput(
+        label="Cupo máximo de alumnos", placeholder="Ej. 5", required=False, default="5", max_length=3,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1977,15 +2118,21 @@ class AgendarSesionModal(discord.ui.Modal, title="Agendar sesión de Academia"):
         if not minutos_txt.isdigit() or int(minutos_txt) <= 0:
             await interaction.followup.send("Ingresa un número de minutos válido.", ephemeral=True)
             return
-        cupo_txt = str(self.cupo) or "10"
-        cupo_val = int(cupo_txt) if cupo_txt.isdigit() and int(cupo_txt) > 0 else 10
+        cupo_txt = str(self.cupo) or "5"
+        cupo_val = int(cupo_txt) if cupo_txt.isdigit() and int(cupo_txt) > 0 else 5
         programado_ms = int(
             (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=int(minutos_txt))).timestamp() * 1000
         )
-        await sessions_core.create_session(
+        sesion = await sessions_core.create_session(
             db, category=str(self.categoria), course_title=str(self.curso), instructor_id=str(interaction.user.id),
             scheduled_at_ms=programado_ms, max_students=cupo_val,
         )
+        try:
+            # Publica el panel de la sesión YA, agendada — así "Unirse" está
+            # disponible desde este momento, no recién cuando empiece.
+            await _publicar_panel_sesion(sesion)
+        except Exception as err:
+            print(f"ERROR al publicar el panel de la sesión agendada: {err}")
         try:
             await _repostear_sesiones_agendadas()
         except Exception as err:
@@ -2023,8 +2170,25 @@ class AnuncioSesionModal(discord.ui.Modal, title="Anunciar sesión"):
         if not canal:
             await interaction.followup.send("No pude ubicar el canal de sesiones.", ephemeral=True)
             return
-        await canal.send(f"📢 **{self.sesion['course_title']}** ({self.sesion['category']}): {str(self.texto)}")
-        await interaction.followup.send("Anuncio publicado. ✅", ephemeral=True)
+        mensaje = await canal.send(
+            f"📢 **{self.sesion['course_title']}** ({self.sesion['category']}): {str(self.texto)}"
+        )
+        # El panel de sesiones agendadas siempre tiene que quedar debajo de
+        # este anuncio, no arriba — y el anuncio en sí es temporal.
+        try:
+            await _repostear_sesiones_agendadas()
+        except Exception as err:
+            print(f"Aviso: no pude reordenar el panel de sesiones tras el anuncio: {err}")
+
+        async def _autoborrar():
+            await asyncio.sleep(300)  # 5 min
+            try:
+                await mensaje.delete()
+            except discord.HTTPException:
+                pass
+
+        asyncio.create_task(_autoborrar())
+        await interaction.followup.send("Anuncio publicado — se borra solo en 5 minutos. ✅", ephemeral=True)
 
 
 class PanelInstructorAccionView(discord.ui.View):
@@ -2083,8 +2247,10 @@ class PanelInstructorAccionView(discord.ui.View):
     async def cancelar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         await sessions_core.set_state(db, self.sesion["uuid"], sessions_core.CANCELLED)
-        if self.sesion["state"] == sessions_core.LIVE:
-            await _cerrar_mensaje_sesion_en_vivo(self.sesion)
+        # El panel de la sesión existe desde que se agenda (no solo cuando
+        # está en vivo), así que hay que borrarlo siempre, sin importar en
+        # qué estado estaba al cancelarla.
+        await _cerrar_mensaje_sesion_en_vivo(self.sesion)
         await _repostear_sesiones_agendadas()
         await interaction.followup.send("Sesión cancelada.", ephemeral=True)
 
@@ -2505,8 +2671,35 @@ async def _crear_canal_atc(fila: dict) -> tuple[str | None, str | None]:
     if categoria is None:
         categoria = discord.utils.get(guild.categories, name=icao)
     if categoria is None:
+        # Permisos heredados de la categoría dinámica del aeródromo (pedido
+        # explícito de la reestructuración de permisos): NV afuera, V/FLT/ATC
+        # pueden conectarse y hablar, MUTE ve pero no habla, Staff alto con
+        # acceso completo. Se define acá porque discord.py no tiene forma de
+        # "heredar" overwrites de otra categoría — hay que pasarlos al crearla.
+        overwrites = {}
+        nv_role = guild.get_role(NV_ROLE_ID)
+        if nv_role:
+            overwrites[nv_role] = discord.PermissionOverwrite(view_channel=False)
+        v_role = guild.get_role(V_ROLE_ID)
+        if v_role:
+            overwrites[v_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        flt_role = guild.get_role(FLT_ROLE_ID)
+        if flt_role:
+            overwrites[flt_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        atc_role = guild.get_role(ATC_ROLE_ID)
+        if atc_role:
+            overwrites[atc_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        mute_role = guild.get_role(DISCORD_ROLE_MUTE)
+        if mute_role:
+            overwrites[mute_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=False)
+        for rid in (1238796825415389288, 1238796825415389287, STF_ROLE_ID):  # CEO, EXO, STF
+            rol = guild.get_role(rid)
+            if rol:
+                overwrites[rol] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         try:
-            categoria = await guild.create_category(icao, reason="Nuevo aeródromo con control activo")
+            categoria = await guild.create_category(
+                icao, overwrites=overwrites, reason="Nuevo aeródromo con control activo"
+            )
         except discord.Forbidden:
             print(f"Aviso: sin permiso para crear la categoría de voz de {icao}")
             return None, None
@@ -2839,13 +3032,22 @@ class ATISModal1(discord.ui.Modal, title="ATIS (1/2) — pistas, viento, visibil
         self.atc_uuid = atc_uuid
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Discord no deja abrir un modal como respuesta a OTRO modal (error
+        # real visto en producción: "Value must be one of {4, 5, 6, 7, 10,
+        # 12}" — Discord solo acepta un modal como respuesta a un botón/
+        # select o a un slash command). Hay que pasar por un botón
+        # intermedio para el segundo modal.
         try:
-            await interaction.response.send_modal(ATISModal2(
-                self.atc_uuid, str(self.ident), str(self.pista_salida), str(self.pista_llegada),
-                str(self.viento), str(self.visibilidad),
-            ))
+            await interaction.response.send_message(
+                "Primeros datos guardados. Presiona el botón para completar el ATIS (nubes, QNH, RMKs).",
+                view=ContinuarATISView(
+                    self.atc_uuid, str(self.ident), str(self.pista_salida), str(self.pista_llegada),
+                    str(self.viento), str(self.visibilidad),
+                ),
+                ephemeral=True,
+            )
         except Exception as err:
-            print(f"ERROR al abrir el segundo modal de ATIS (posición {self.atc_uuid}): {err!r}")
+            print(f"ERROR al continuar el flujo de ATIS (posición {self.atc_uuid}): {err!r}")
             raise
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -2858,6 +3060,23 @@ class ATISModal1(discord.ui.Modal, title="ATIS (1/2) — pistas, viento, visibil
                 await interaction.response.send_message(f"No pude continuar con el ATIS: {error}", ephemeral=True)
         except discord.HTTPException:
             pass
+
+
+class ContinuarATISView(discord.ui.View):
+    def __init__(self, atc_uuid: str, ident: str, pista_salida: str, pista_llegada: str, viento: str, visibilidad: str):
+        super().__init__(timeout=300)
+        self.atc_uuid = atc_uuid
+        self.ident = ident
+        self.pista_salida = pista_salida
+        self.pista_llegada = pista_llegada
+        self.viento = viento
+        self.visibilidad = visibilidad
+
+    @discord.ui.button(label="Continuar ATIS (2/2)", style=discord.ButtonStyle.primary, emoji="🌦️")
+    async def continuar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ATISModal2(
+            self.atc_uuid, self.ident, self.pista_salida, self.pista_llegada, self.viento, self.visibilidad,
+        ))
 
 
 class ATCDashboardView(discord.ui.View):
@@ -4101,6 +4320,10 @@ _tabla_atc_lock = asyncio.Lock()
 _tabla_atc_pendientes_borrar: list = []
 
 SOLICITAR_CONTROL_CUSTOM_ID = "atc24:solicitar_control"
+# Link de invitación al servidor de Roblox — botón de tipo "link" en la
+# tabla de controladores, configurable por si cambia (los links de invitación
+# de Roblox pueden expirar/rotar).
+LINK_SERVIDOR_ROBLOX = os.environ.get("LINK_SERVIDOR_ROBLOX") or "https://www.roblox.com/share?code=b8ff9e346139a142a3d1f42c0d9398a9&type=Server"
 
 
 def _construir_payload_tabla_atc(activos: list):
@@ -4146,7 +4369,13 @@ def _construir_payload_tabla_atc(activos: list):
                                 "style": 3,
                                 "label": "Solicitar apertura de posición",
                                 "custom_id": SOLICITAR_CONTROL_CUSTOM_ID,
-                            }
+                            },
+                            {
+                                "type": 2,
+                                "style": 5,  # link — no lleva custom_id, lleva url
+                                "label": "Unirse al servidor",
+                                "url": LINK_SERVIDOR_ROBLOX,
+                            },
                         ],
                     },
                 ],
@@ -4252,6 +4481,12 @@ def _agrupar_sesiones_por_categoria(sesiones: list, *, en_vivo: bool) -> list:
     return bloques
 
 
+# Semilla fija — a diferencia de una sesión puntual (uuid propio), este
+# panel es único (siempre el mismo mensaje), así que la semilla también es
+# fija para que la variante de imagen no "cambie" en cada edición.
+_SEMILLA_PANEL_SESIONES_AGENDADAS = "panel_sesiones_agendadas"
+
+
 def _construir_payload_sesiones_agendadas(sesiones: list, en_vivo: list | None = None):
     en_vivo = en_vivo or []
     secciones = []
@@ -4264,32 +4499,37 @@ def _construir_payload_sesiones_agendadas(sesiones: list, en_vivo: list | None =
         cuerpo = "_No hay sesiones agendadas ni en vivo por ahora. Un instructor puede agendar una desde `/academia`._"
     else:
         cuerpo = "\n\n".join(secciones)
-    return {
+    # Este panel mezcla varias ramas a la vez, así que no tiene sentido
+    # usar el banner de una rama puntual (BRANCH_BANNERS) — lleva la imagen
+    # de identidad general de ATC24 (la misma que los demás embeds
+    # formales), determinística porque este mensaje se edita todo el
+    # tiempo.
+    nombre_banner = _nombre_imagen_formal_determinista(_SEMILLA_PANEL_SESIONES_AGENDADAS)
+    componentes_container = []
+    if nombre_banner:
+        componentes_container.append({"type": 12, "items": [{"media": {"url": f"attachment://{nombre_banner}"}}]})
+    componentes_container.append({"type": 10, "content": f"{E['libro']} **ATC24 Español — Sesiones de Academia**"})
+    componentes_container.append({"type": 14, "divider": True, "spacing": 1})
+    componentes_container.append({"type": 10, "content": cuerpo})
+    componentes_container.append({
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 3, "label": "Solicitar una sesión", "custom_id": SOLICITAR_SESION_CUSTOM_ID},
+        ],
+    })
+    payload = {
         "flags": 32768,
         "allowed_mentions": {"parse": []},
-        "components": [
-            {
-                "type": 17, "accent_color": BRAND_BEACON_AMBER,
-                "components": [
-                    {"type": 10, "content": f"{E['libro']} **ATC24 Español — Sesiones de Academia**"},
-                    {"type": 14, "divider": True, "spacing": 1},
-                    {"type": 10, "content": cuerpo},
-                    {
-                        "type": 1,
-                        "components": [
-                            {"type": 2, "style": 3, "label": "Solicitar una sesión", "custom_id": SOLICITAR_SESION_CUSTOM_ID},
-                        ],
-                    },
-                ],
-            },
-        ],
+        "components": [{"type": 17, "accent_color": BRAND_BEACON_AMBER, "components": componentes_container}],
     }
+    return payload, nombre_banner
 
 
 async def _repostear_sesiones_agendadas():
-    """Edita in-place el panel de sesiones agendadas (crea uno si todavía no
-    existe). A diferencia de la tabla ATC no hace falta que sea el último
-    mensaje del canal, así que editar alcanza — no hay que borrar/recrear."""
+    """Borra el panel viejo (si existe) y publica uno nuevo — igual que la
+    tabla de ATC, para que quede siempre como el último mensaje del canal.
+    Lo dispara on_message en el canal de Academia (con cooldown), además de
+    cada vez que cambia el estado de una sesión."""
     global _sesiones_message_id
     if not DISCORD_CHANNEL_ACADEMIA_SESIONES:
         return
@@ -4298,21 +4538,34 @@ async def _repostear_sesiones_agendadas():
         en_vivo = await sessions_core.live_sessions(db)
         for s in sesiones + en_vivo:
             s["_inscritos"] = await sessions_core.count_signups(db, s["uuid"])
-        payload = _construir_payload_sesiones_agendadas(sesiones, en_vivo)
+        payload, nombre_banner = _construir_payload_sesiones_agendadas(sesiones, en_vivo)
         headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
 
         if _sesiones_message_id:
-            status, data, texto = await _discord_request(
-                "PATCH", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages/{_sesiones_message_id}",
-                headers=headers, json_body=payload,
-            )
-            if status < 300:
-                return
-            if status != 404:
-                print(f"Aviso: no pude editar el panel de sesiones agendadas: {status} {texto or data}")
-                return
-            _sesiones_message_id = None  # lo borraron a mano — cae a crear uno nuevo abajo
+            try:
+                status_del, data_del, texto_del = await _discord_request(
+                    "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages/{_sesiones_message_id}",
+                    headers=headers,
+                )
+                if status_del not in (204, 404):
+                    print(f"Aviso: no pude borrar el panel de sesiones agendadas viejo: {status_del} {texto_del or data_del}")
+            except Exception as err:
+                print(f"Aviso: no pude borrar el panel de sesiones agendadas viejo: {err}")
+            _sesiones_message_id = None
             await bot_state.set(db, "sesiones_agendadas_message_id", None)
+
+        if nombre_banner:
+            ruta = os.path.join(CARPETA_SCRIPT, "assets", nombre_banner)
+            if os.path.exists(ruta):
+                try:
+                    data = await _publicar_payload_con_archivo(
+                        int(DISCORD_CHANNEL_ACADEMIA_SESIONES), payload, ruta_archivo=ruta, nombre_archivo=nombre_banner
+                    )
+                    _sesiones_message_id = data["id"]
+                    await bot_state.set(db, "sesiones_agendadas_message_id", _sesiones_message_id)
+                    return
+                except Exception as err:
+                    print(f"Aviso: no pude publicar el panel de sesiones agendadas con banner, lo mando sin imagen: {err}")
 
         status, data, texto = await _discord_request(
             "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages",
@@ -4368,12 +4621,35 @@ class ConfirmarDisponibilidadView(discord.ui.View):
             if categoria is None:
                 try:
                     categoria = await guild.create_category("Academia — Sesiones")
+                    # Se ubica justo debajo de la categoría ACADEMIA (arriba
+                    # de TERMINAL) en vez de quedar al final del todo, que es
+                    # donde Discord la pondría por defecto.
+                    cat_academia = guild.get_channel(1238796826317164631)
+                    if cat_academia:
+                        try:
+                            await categoria.edit(position=cat_academia.position + 1)
+                        except discord.HTTPException as err:
+                            print(f"Aviso: no pude reposicionar la categoría 'Academia — Sesiones': {err}")
                 except discord.Forbidden:
                     categoria = None
+            # Privado por alumno/instructor (pedido explícito de la
+            # reestructuración de permisos): antes quedaba abierto a
+            # cualquiera que viera la categoría.
+            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+            alumno_member = guild.get_member(self.alumno_id)
+            if alumno_member:
+                overwrites[alumno_member] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+            instructor_member = guild.get_member(self.instructor_id)
+            if instructor_member:
+                overwrites[instructor_member] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+            for rid in (1238796825415389288, 1238796825415389287, STF_ROLE_ID):  # CEO, EXO, STF
+                rol = guild.get_role(rid)
+                if rol:
+                    overwrites[rol] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
             try:
                 canal_voz = await guild.create_voice_channel(
                     f"{self.rating}-{interaction.user.display_name}"[:100], category=categoria,
-                    reason="Salón de sesión individual de Academia",
+                    overwrites=overwrites, reason="Salón de sesión individual de Academia",
                 )
             except discord.Forbidden:
                 canal_voz = None
@@ -4479,26 +4755,37 @@ def _barra_cupo(inscritos: int, maximo: int | None, *, largo: int = 10) -> str:
 
 
 def _construir_payload_sesion_en_vivo(sesion: dict, inscritos: int):
-    # live_since es lo correcto acá (cuándo arrancó de verdad) — scheduled_at
-    # es solo referencia de fallback para filas viejas de antes de esta
-    # migración. <t:...:R> lo actualiza Discord solo del lado del cliente,
-    # así que "tiempo transcurrido" queda siempre al día sin que el bot
-    # tenga que re-editar el mensaje solo para eso.
-    ts_inicio = int((sesion.get("live_since") or sesion["scheduled_at"]) / 1000)
+    # live_since es lo correcto para "en curso desde" — scheduled_at es la
+    # referencia mientras todavía está agendada (y el fallback para filas
+    # viejas de antes de esta migración). <t:...:R> lo actualiza Discord
+    # solo del lado del cliente, así que "tiempo transcurrido"/"empieza en"
+    # queda siempre al día sin que el bot tenga que re-editar el mensaje
+    # solo por eso.
+    en_vivo = sesion["state"] == sessions_core.LIVE
     maximo = sesion.get("max_students")
     cupo = f"{inscritos}/{maximo}" if maximo is not None else str(inscritos)
     barra = _barra_cupo(inscritos, maximo)
+    if en_vivo:
+        ts = int((sesion.get("live_since") or sesion["scheduled_at"]) / 1000)
+        titulo = f"**{sesion['course_title']}: en curso**"
+        cuando = f"en curso desde <t:{ts}:R>"
+    else:
+        ts = int(sesion["scheduled_at"] / 1000)
+        titulo = f"**{sesion['course_title']}: agendada**"
+        cuando = f"empieza <t:{ts}:R>"
     lineas = [
-        f"**{sesion['course_title']}: en curso**",
+        titulo,
         "",
-        f"<@{sesion['instructor_id']}> está dando una sesión de **{sesion['course_title']}** "
-        f"enfocada en **{sesion['category']}** — en curso desde <t:{ts_inicio}:R>.",
-        f"`{barra}` **{cupo}** alumno(s) anotados. Usa **Ver alumnos** para ver quién está anotado.",
+        f"<@{sesion['instructor_id']}> {'está dando' if en_vivo else 'va a dar'} una sesión de "
+        f"**{sesion['course_title']}** enfocada en **{sesion['category']}** — {cuando}.",
+        f"`{barra}` **{cupo}** alumno(s) anotados. Usa **Unirse** para anotarte desde ahora, o **Ver alumnos** "
+        "para ver quién ya está anotado.",
     ]
     componentes_container = []
     # El nombre se elige con el uuid de la sesión como semilla — así una
-    # edición posterior (join/salir) recalcula el mismo nombre de archivo
-    # en vez de "cambiar" la imagen ya adjunta al mensaje original.
+    # edición posterior (join/salir, o pasar de agendada a en vivo)
+    # recalcula el mismo nombre de archivo en vez de "cambiar" la imagen ya
+    # adjunta al mensaje original.
     rama = _RATING_A_RAMA.get(sesion["category"])
     nombre_banner = _nombre_banner_academia(rama, semilla=sesion["uuid"]) if rama else None
     if nombre_banner:
@@ -4519,11 +4806,36 @@ def _construir_payload_sesion_en_vivo(sesion: dict, inscritos: int):
     }, nombre_banner
 
 
-async def _publicar_sesion_en_vivo(sesion: dict):
+async def _publicar_panel_sesion(sesion: dict, *, forzar_live: bool = False) -> dict:
+    """Publica el panel de una sesión (agendada o en vivo) o edita el que ya
+    existe — es el MISMO mensaje desde que se agenda hasta que arranca de
+    verdad, así "Unirse" funciona desde el momento en que se agenda la
+    clase, no recién cuando empieza."""
     if not DISCORD_CHANNEL_ACADEMIA_SESIONES:
-        return
+        return sesion
+    if forzar_live and sesion["state"] != sessions_core.LIVE:
+        await sessions_core.set_live(
+            db, sesion["uuid"], sesion.get("channel_id") or DISCORD_CHANNEL_ACADEMIA_SESIONES,
+            sesion.get("message_id") or "",
+        )
+        sesion = await sessions_core.get_session(db, sesion["uuid"])
+
     inscritos = await sessions_core.count_signups(db, sesion["uuid"])
     payload, nombre_banner = _construir_payload_sesion_en_vivo(sesion, inscritos)
+
+    if sesion.get("channel_id") and sesion.get("message_id"):
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+        status, data, texto = await _discord_request(
+            "PATCH", f"https://discord.com/api/v10/channels/{sesion['channel_id']}/messages/{sesion['message_id']}",
+            headers=headers, json_body=payload,
+        )
+        if status < 300:
+            return sesion
+        if status != 404:
+            print(f"Aviso: no pude editar el panel de la sesión {sesion['uuid']}: {status} {texto or data}")
+            return sesion
+        # 404: lo borraron a mano — cae a publicar uno nuevo abajo.
+
     if nombre_banner:
         ruta = os.path.join(CARPETA_SCRIPT, "assets", nombre_banner)
         if os.path.exists(ruta):
@@ -4531,19 +4843,25 @@ async def _publicar_sesion_en_vivo(sesion: dict):
                 data = await _publicar_payload_con_archivo(
                     int(DISCORD_CHANNEL_ACADEMIA_SESIONES), payload, ruta_archivo=ruta, nombre_archivo=nombre_banner
                 )
-                await sessions_core.set_live(db, sesion["uuid"], DISCORD_CHANNEL_ACADEMIA_SESIONES, data["id"])
-                return
+                await sessions_core.set_message(db, sesion["uuid"], DISCORD_CHANNEL_ACADEMIA_SESIONES, data["id"])
+                return await sessions_core.get_session(db, sesion["uuid"])
             except Exception as err:
-                print(f"Aviso: no pude publicar la sesión en vivo {sesion['uuid']} con banner, la mando sin imagen: {err}")
+                print(f"Aviso: no pude publicar el panel de la sesión {sesion['uuid']} con banner, lo mando sin imagen: {err}")
     headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
     status, data, texto = await _discord_request(
         "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages",
         headers=headers, json_body=payload,
     )
     if status >= 300:
-        print(f"Aviso: no pude publicar la sesión en vivo {sesion['uuid']}: {status} {texto or data}")
-        return
-    await sessions_core.set_live(db, sesion["uuid"], DISCORD_CHANNEL_ACADEMIA_SESIONES, data["id"])
+        print(f"Aviso: no pude publicar el panel de la sesión {sesion['uuid']}: {status} {texto or data}")
+        return sesion
+    await sessions_core.set_message(db, sesion["uuid"], DISCORD_CHANNEL_ACADEMIA_SESIONES, data["id"])
+    return await sessions_core.get_session(db, sesion["uuid"])
+
+
+async def _publicar_sesion_en_vivo(sesion: dict):
+    """Alias histórico — pasa la sesión a 'live' y publica/edita su panel."""
+    await _publicar_panel_sesion(sesion, forzar_live=True)
 
 
 async def _actualizar_mensaje_sesion_en_vivo(sesion: dict):
@@ -4624,8 +4942,8 @@ async def _sesiones_academia_loop():
 
 async def _procesar_boton_sesion(interaction: discord.Interaction, accion: str, session_uuid: str):
     sesion = await sessions_core.get_session(db, session_uuid)
-    if not sesion or sesion["state"] != sessions_core.LIVE:
-        await interaction.response.send_message("Esta sesión ya no está activa.", ephemeral=True)
+    if not sesion or sesion["state"] not in (sessions_core.SCHEDULED, sessions_core.LIVE):
+        await interaction.response.send_message("Esta sesión ya no está disponible.", ephemeral=True)
         return
 
     if accion == "join":
@@ -5213,6 +5531,8 @@ async def _procesar_mensaje_conteo(message: discord.Message):
 
 _TABLA_ATC_REPOST_COOLDOWN = 3  # segundos — evita golpear el rate limit de Discord si el canal está activo
 _tabla_atc_ultimo_repost_ts = 0.0
+_SESIONES_REPOST_COOLDOWN = 3
+_sesiones_ultimo_repost_ts = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -5345,6 +5665,12 @@ AYUDA_SECCIONES = {
         "campos": [
             (
                 "Comandos de texto administrativos",
+                "**!test** — diagnóstico de configuración: comprueba que los canales/roles configurados existan y "
+                "que el bot los vea, que la base de datos responda y que los assets de imagen estén en su lugar "
+                "(no ejecuta los comandos de verdad, no crea vuelos/posiciones/tickets reales)\n"
+                "**!dashboards** — fuerza un refresco de los paneles con datos en vivo (tabla ATC, sesiones de "
+                "Academia, nominadas de Foto de la Semana); ya se hace solo cada vez que el bot arranca, esto es "
+                "para forzarlo a mano\n"
                 "**!staff** — publica el Dashboard de Staff permanente\n"
                 "**!panel-soporte** — publica el panel fijo de tickets de soporte\n"
                 "**!publicar-verificacion / !publicar-guia / !publicar-guia-bloxlink / !publicar-guia-vuelo / "
@@ -5447,6 +5773,107 @@ class AyudaView(discord.ui.View):
         return True
 
 
+async def _chequear_canal(guild: discord.Guild, canal_id) -> tuple[bool, str]:
+    if not canal_id:
+        return False, "sin configurar"
+    canal = guild.get_channel(int(canal_id))
+    if canal is None:
+        try:
+            canal = await guild.fetch_channel(int(canal_id))
+        except (discord.NotFound, discord.Forbidden, ValueError):
+            return False, f"`{canal_id}` no existe o el bot no lo ve"
+    return True, canal.mention
+
+
+async def _chequear_rol(guild: discord.Guild, rol_id) -> tuple[bool, str]:
+    if not rol_id:
+        return False, "sin configurar"
+    rol = guild.get_role(int(rol_id))
+    if rol is None:
+        return False, f"`{rol_id}` no existe en este servidor"
+    return True, rol.mention
+
+
+async def _embed_diagnostico(guild: discord.Guild) -> discord.Embed:
+    """!test — chequeo de configuración, no ejecuta los comandos reales."""
+    embed = discord.Embed(title="Diagnóstico de ATC24 Español", color=BRAND_SKY_NAVY)
+
+    # Base de datos
+    try:
+        await db.execute("SELECT 1")
+        embed.add_field(name="Base de datos", value="✅ responde", inline=True)
+    except Exception as err:
+        embed.add_field(name="Base de datos", value=f"❌ {err}", inline=True)
+
+    # Canales
+    canales_a_chequear = [
+        ("Planes de vuelo / /vuelo", DISCORD_CHANNEL_FLIGHTS),
+        ("Canal de comando /vuelo", DISCORD_CHANNEL_VUELO_CMD),
+        ("ATC / /atc", DISCORD_CHANNEL_ATC),
+        ("Canal de comando /atc", DISCORD_CHANNEL_ATC_CMD),
+        ("ATIS", DISCORD_CHANNEL_ATIS),
+        ("Solicitud de control extra", CANAL_SOLICITUD_CONTROL_EXTRA),
+        ("Sesiones de Academia", DISCORD_CHANNEL_ACADEMIA_SESIONES),
+        ("Solicitudes de clase", DISCORD_CHANNEL_SOLICITUDES_CLASE),
+        ("Anuncios de Academia", DISCORD_CHANNEL_ANUNCIOS_ACADEMIA),
+        ("Log de moderación", DISCORD_CHANNEL_MOD_LOG),
+        ("Apelaciones", DISCORD_CHANNEL_APELACIONES),
+        ("Conteo", DISCORD_CHANNEL_CONTEO),
+        ("Foto de la semana", DISCORD_CHANNEL_FOTO_SEMANA),
+    ]
+    lineas_canales = []
+    for nombre, canal_id in canales_a_chequear:
+        ok, detalle = await _chequear_canal(guild, canal_id)
+        lineas_canales.append(f"{'✅' if ok else '❌'} {nombre} — {detalle}")
+    embed.add_field(name="Canales", value="\n".join(lineas_canales), inline=False)
+
+    # Categoría de tickets
+    ok_tk, detalle_tk = await _chequear_canal(guild, TICKETS_CATEGORY_ID)
+    embed.add_field(name="Categoría de tickets", value=f"{'✅' if ok_tk else '❌'} {detalle_tk}", inline=True)
+
+    # Roles
+    roles_a_chequear = [
+        ("V — Verificado", V_ROLE_ID), ("NV — No Verificado", NV_ROLE_ID),
+        ("ATC (base)", ATC_ROLE_ID), ("FLT — Piloto (base)", FLT_ROLE_ID),
+        ("STF — Staff", STF_ROLE_ID), ("MUTE", DISCORD_ROLE_MUTE),
+        ("Soporte", SOPORTE_ROLE_ID),
+    ]
+    lineas_roles = []
+    for nombre, rol_id in roles_a_chequear:
+        ok, detalle = await _chequear_rol(guild, rol_id)
+        lineas_roles.append(f"{'✅' if ok else '❌'} {nombre} — {detalle}")
+    embed.add_field(name="Roles", value="\n".join(lineas_roles), inline=False)
+
+    # Integraciones externas
+    lineas_extra = [
+        f"{'✅' if BLOXLINK_API_KEY else '⚠️'} Bloxlink — {'configurado' if BLOXLINK_API_KEY else 'sin configurar (apodos y planes de vuelo muestran solo el nombre de Discord)'}",
+        f"{'✅' if GUILD_ID else '❌'} GUILD_ID — {'configurado' if GUILD_ID else 'sin configurar'}",
+    ]
+    embed.add_field(name="Integraciones", value="\n".join(lineas_extra), inline=False)
+
+    # Assets de imagen
+    assets_a_chequear = [
+        "banner_bienvenida.png", "certificado_fondo.png", "formal_embed_1.png", "formal_embed_2.png",
+        "fuente_bienvenida.ttf", "fuente_mono.ttf",
+        "banner_academia_pilotos_1.png", "banner_academia_atc_1.png", "banner_academia_groundcrew_1.png",
+    ]
+    faltantes = [a for a in assets_a_chequear if not os.path.exists(os.path.join(CARPETA_SCRIPT, "assets", a))]
+    if faltantes:
+        embed.add_field(name="Assets", value="❌ faltan: " + ", ".join(faltantes), inline=False)
+    else:
+        embed.add_field(name="Assets", value=f"✅ los {len(assets_a_chequear)} archivos esperados están presentes", inline=False)
+
+    # Comandos slash sincronizados
+    try:
+        comandos = await tree.fetch_commands()
+        embed.add_field(name="Comandos slash sincronizados", value=f"✅ {len(comandos)} comandos registrados en Discord", inline=False)
+    except Exception as err:
+        embed.add_field(name="Comandos slash sincronizados", value=f"❌ no pude consultarlos: {err}", inline=False)
+
+    embed.set_footer(text="Esto comprueba configuración y conectividad — no ejecuta los comandos de verdad (no crea vuelos, posiciones ATC ni tickets reales).")
+    return embed
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -5492,6 +5919,22 @@ async def on_message(message: discord.Message):
         except Exception as err:
             print(f"ERROR al reenviar la tabla de ATC Online tras un mensaje nuevo: {err}")
 
+    # Canal de sesiones de Academia: mismo mecanismo que la tabla ATC — el
+    # panel de "Sesiones agendadas" siempre queda como el último mensaje del
+    # canal, así que un anuncio rápido de instructor (que además se autoborra
+    # a los 5 min) puede aparecer arriba sin que el panel quede "tapado".
+    global _sesiones_ultimo_repost_ts
+    if (
+        DISCORD_CHANNEL_ACADEMIA_SESIONES
+        and message.channel.id == int(DISCORD_CHANNEL_ACADEMIA_SESIONES)
+        and asyncio.get_running_loop().time() - _sesiones_ultimo_repost_ts > _SESIONES_REPOST_COOLDOWN
+    ):
+        _sesiones_ultimo_repost_ts = asyncio.get_running_loop().time()
+        try:
+            await _repostear_sesiones_agendadas()
+        except Exception as err:
+            print(f"ERROR al reenviar el panel de sesiones agendadas tras un mensaje nuevo: {err}")
+
     # Canal de conteo (estilo countingbot.com): hay que postear el número
     # siguiente al actual, y nadie puede contar dos veces seguidas. Si se
     # rompe la cuenta, vuelve a 0.
@@ -5500,6 +5943,37 @@ async def on_message(message: discord.Message):
         return
 
     comando = message.content.strip()
+
+    # "!test" — diagnóstico de configuración: NO ejecuta los comandos reales
+    # (crear un vuelo, una posición ATC o un ticket de verdad en producción
+    # sería destructivo/ruidoso) — en cambio comprueba que todo lo que esos
+    # comandos necesitan para funcionar esté bien configurado: canales
+    # existen y el bot los ve, roles existen, la base de datos responde,
+    # los assets de imagen están en su lugar. Es lo que hubiera detectado de
+    # entrada varios de los problemas de esta noche (canal mal configurado,
+    # ID apuntando a un canal que no existe, etc.).
+    if comando.lower() == "!test":
+        if not message.author.guild_permissions.administrator:
+            await message.reply("Este comando es solo para administradores.", delete_after=8)
+            return
+        await message.channel.send(embed=await _embed_diagnostico(message.guild))
+        return
+
+    # "!dashboards" — fuerza un refresco de los paneles con datos en vivo
+    # (tabla ATC, sesiones de Academia, nominadas de Foto de la Semana) sin
+    # esperar al próximo trigger natural. Esto ya pasa solo cada vez que el
+    # bot arranca — este comando es para forzarlo a mano si hace falta
+    # (ej. después de tocar algo a mano en esos canales).
+    if comando.lower() == "!dashboards":
+        if not message.author.guild_permissions.administrator:
+            await message.reply("Este comando es solo para administradores.", delete_after=8)
+            return
+        refrescados = await _refrescar_dashboards_en_vivo()
+        if refrescados:
+            await message.channel.send("Paneles refrescados: " + ", ".join(refrescados) + " ✅")
+        else:
+            await message.channel.send("No pude refrescar ningún panel — revisa los logs para el detalle.")
+        return
 
     # "!help" — guía interactiva por categorías (Bloque de idioma/UX):
     # reemplaza a la lista estática anterior Y al viejo "!funciones" (que se

@@ -103,6 +103,18 @@ async def due_sessions(conn: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def set_message(conn: aiosqlite.Connection, session_uuid: str, channel_id: str, message_id: str) -> None:
+    """Guarda dónde vive el panel de la sesión SIN tocar su estado — se usa
+    al publicarlo por primera vez, todavía 'scheduled' (antes de que
+    empiece), para que el mismo mensaje se pueda editar in-place más tarde
+    en vez de crear uno nuevo cuando pase a 'live'."""
+    await conn.execute(
+        "UPDATE academy_sessions SET channel_id = ?, message_id = ?, updated_at = ? WHERE uuid = ?",
+        (channel_id, message_id, _now_ms(), session_uuid),
+    )
+    await conn.commit()
+
+
 async def set_live(conn: aiosqlite.Connection, session_uuid: str, channel_id: str, message_id: str) -> None:
     now = _now_ms()
     await conn.execute(
