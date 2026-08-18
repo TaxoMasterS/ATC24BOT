@@ -2410,7 +2410,7 @@ class ConfirmarVueloView(discord.ui.View):
 @app_commands.describe(
     callsign="Callsign de tu aeronave (ej. AEA1234)", aircraft="Tipo de aeronave (ej. A320, B738)",
     salida="Aeródromo de salida", llegada="Aeródromo de llegada", nivel="Nivel de vuelo (ej. FL350)",
-    reglas="Reglas de vuelo", alterno="Aeródromo alterno", squawk="Código squawk de 4 dígitos (ej. 2000)",
+    reglas="Reglas de vuelo", alterno="Aeródromo alterno",
     ruta="Ruta de vuelo (opcional — se usa DCT si se deja vacía)",
     observaciones="Información adicional para control (opcional)",
 )
@@ -2422,21 +2422,21 @@ async def vuelo(
     interaction: discord.Interaction,
     callsign: str, aircraft: str, salida: app_commands.Choice[str], llegada: app_commands.Choice[str],
     nivel: str, reglas: app_commands.Choice[str], alterno: app_commands.Choice[str],
-    squawk: str, ruta: str = None, observaciones: str = None,
+    ruta: str = None, observaciones: str = None,
 ):
     if interaction.channel_id != int(DISCORD_CHANNEL_VUELO_CMD):
         await interaction.response.send_message(
             f"Este comando solo se puede usar en <#{DISCORD_CHANNEL_VUELO_CMD}>.", ephemeral=True
         )
         return
-    if not squawk.isdigit() or len(squawk) != 4:
-        await interaction.response.send_message("El squawk debe ser un número de 4 dígitos.", ephemeral=True)
-        return
     await interaction.response.defer(ephemeral=True)
+    # El squawk NO se pide al presentar el plan — recién se asigna cuando
+    # ATC autoriza el vuelo, desde el botón "Cambiar squawk" del panel
+    # privado (SquawkModal). Arranca vacío a propósito.
     fila = await atc_core.create_flight(
         db, owner_id=str(interaction.user.id), callsign=callsign, aircraft_type=aircraft,
         departure=salida.value, destination=llegada.value, level=nivel, flight_rules=reglas.value,
-        route=ruta or "", alternate=alterno.value, remarks=observaciones, squawk=squawk,
+        route=ruta or "", alternate=alterno.value, remarks=observaciones,
     )
     try:
         roblox_name = await _roblox_username(interaction.user.id)
@@ -2811,6 +2811,21 @@ class ATISModal2(discord.ui.Modal, title="ATIS (2/2) — nubes, QNH, RMKs"):
             return
         await interaction.followup.send(f"ATIS {fila['airport']} {self.ident} publicado. ✅", ephemeral=True)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        # Por defecto discord.py solo imprime el traceback y nunca le
+        # contesta nada a Discord — el cliente entonces muestra su propio
+        # "Algo salió mal" genérico en vez de un mensaje nuestro. Con esto,
+        # cualquier excepción no prevista igual le llega algo a quien lo usó.
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"No pude publicar el ATIS: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"No pude publicar el ATIS: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
 
 class ATISModal1(discord.ui.Modal, title="ATIS (1/2) — pistas, viento, visibilidad"):
     ident = discord.ui.TextInput(label="Letra de información (ej. A, B, C)", max_length=2)
@@ -2824,10 +2839,25 @@ class ATISModal1(discord.ui.Modal, title="ATIS (1/2) — pistas, viento, visibil
         self.atc_uuid = atc_uuid
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(ATISModal2(
-            self.atc_uuid, str(self.ident), str(self.pista_salida), str(self.pista_llegada),
-            str(self.viento), str(self.visibilidad),
-        ))
+        try:
+            await interaction.response.send_modal(ATISModal2(
+                self.atc_uuid, str(self.ident), str(self.pista_salida), str(self.pista_llegada),
+                str(self.viento), str(self.visibilidad),
+            ))
+        except Exception as err:
+            print(f"ERROR al abrir el segundo modal de ATIS (posición {self.atc_uuid}): {err!r}")
+            raise
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"No pude continuar con el ATIS: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"No pude continuar con el ATIS: {error}", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 class ATCDashboardView(discord.ui.View):
