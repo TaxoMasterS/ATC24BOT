@@ -131,7 +131,7 @@ DISCORD_CHANNEL_ATIS = os.environ.get("DISCORD_CHANNEL_ATIS") or "15017339161285
 # Canal donde vive el panel de "Sesiones agendadas" de Academia y se publican
 # las sesiones en vivo (Fase C, sistema de sesiones). Opcional — si no está
 # configurado, "Agendar sesión" (en /academia) sigue guardando la sesión pero no hay panel.
-DISCORD_CHANNEL_ACADEMIA_SESIONES = os.environ.get("DISCORD_CHANNEL_ACADEMIA_SESIONES")
+DISCORD_CHANNEL_ACADEMIA_SESIONES = os.environ.get("DISCORD_CHANNEL_ACADEMIA_SESIONES") or "1238796826526748754"
 # Canal interno donde llegan las solicitudes de clase individual (Bloque
 # C1/C2) para que un instructor las reclame.
 DISCORD_CHANNEL_SOLICITUDES_CLASE = os.environ.get("DISCORD_CHANNEL_SOLICITUDES_CLASE") or "1238796826526748755"
@@ -142,7 +142,7 @@ DISCORD_CHANNEL_ANUNCIOS_ACADEMIA = os.environ.get("DISCORD_CHANNEL_ANUNCIOS_ACA
 # correr en su canal designado — cualquier otro mensaje ahí se borra con un
 # aviso. Con default a los IDs reales del servidor, configurable por env var
 # igual que el resto de los canales.
-DISCORD_CHANNEL_VUELO_CMD = os.environ.get("DISCORD_CHANNEL_VUELO_CMD") or "1238796826727944200"
+DISCORD_CHANNEL_VUELO_CMD = os.environ.get("DISCORD_CHANNEL_VUELO_CMD") or DISCORD_CHANNEL_FLIGHTS
 DISCORD_CHANNEL_ATC_CMD = os.environ.get("DISCORD_CHANNEL_ATC_CMD") or "1238796826727944199"
 
 # ─── Sistema de tickets de soporte ─────────────────────────────────────────
@@ -933,7 +933,7 @@ def _construir_payload_votacion_foto_semana(opciones: list) -> dict:
         "# Votación — Foto de la semana",
         "",
         "Elige tu foto favorita de las nominadas esta semana. Un voto por persona; "
-        "podés cambiar tu voto mientras la votación siga abierta.",
+        "puedes cambiar tu voto mientras la votación siga abierta.",
         "",
     ]
     for i, o in enumerate(opciones, start=1):
@@ -1168,6 +1168,14 @@ async def _mantenimiento_atc_loop():
     min si confirma → cierre automático si no)."""
     while True:
         await asyncio.sleep(60)
+
+        # Cada bloque va en su propio try/except: antes estaba todo bajo un
+        # único try, así que si una fila de vuelos tiraba una excepción, el
+        # cierre programado de ATC (más abajo, en la misma pasada) nunca
+        # llegaba a ejecutarse — un problema en un vuelo bloqueaba en
+        # silencio el cierre programado de ATC en TODAS las vueltas del
+        # loop, no solo esa. Con bloques separados, un fallo puntual solo
+        # afecta a esa sección.
         try:
             for fila in await atc_core.flights_para_avisar(db):
                 await atc_core.marcar_flight_avisado(db, fila["uuid"])
@@ -1181,7 +1189,10 @@ async def _mantenimiento_atc_loop():
                     )
                 except (discord.Forbidden, discord.NotFound):
                     pass
+        except Exception as err:
+            print(f"Aviso: fallo al avisar vuelos inactivos: {err}")
 
+        try:
             for fila in await atc_core.flights_para_finalizar_por_inactividad(db):
                 cerrado = await atc_core.close_flight(db, fila["uuid"], atc_core.FLIGHT_EXPIRADO)
                 if not cerrado:
@@ -1192,7 +1203,10 @@ async def _mantenimiento_atc_loop():
                     await usuario.send(f"Tu plan de vuelo **{cerrado['callsign']}** se finalizó automáticamente por inactividad.")
                 except (discord.Forbidden, discord.NotFound):
                     pass
+        except Exception as err:
+            print(f"Aviso: fallo al finalizar vuelos inactivos: {err}")
 
+        try:
             # Bloque A7: cierres de ATC programados desde el panel privado
             # (botón "Programar cierre") cuya hora ya llegó.
             for fila in await atc_core.atc_pendientes_de_cierre_programado(db):
@@ -1208,7 +1222,7 @@ async def _mantenimiento_atc_loop():
                 except Exception as err:
                     print(f"ERROR al actualizar la tabla ATC tras un cierre programado: {err}")
         except Exception as err:
-            print(f"Aviso: fallo en el loop de mantenimiento ATC: {err}")
+            print(f"Aviso: fallo al procesar cierres programados de ATC: {err}")
 
 
 @client.event
@@ -2397,7 +2411,8 @@ class ConfirmarVueloView(discord.ui.View):
     callsign="Callsign de tu aeronave (ej. AEA1234)", aircraft="Tipo de aeronave (ej. A320, B738)",
     salida="Aeródromo de salida", llegada="Aeródromo de llegada", nivel="Nivel de vuelo (ej. FL350)",
     reglas="Reglas de vuelo", alterno="Aeródromo alterno", squawk="Código squawk de 4 dígitos (ej. 2000)",
-    observaciones="Información adicional para control", ruta="Ruta de vuelo (opcional — se usa DCT si se deja vacía)",
+    ruta="Ruta de vuelo (opcional — se usa DCT si se deja vacía)",
+    observaciones="Información adicional para control (opcional)",
 )
 @app_commands.choices(
     reglas=[app_commands.Choice(name="IFR", value="IFR"), app_commands.Choice(name="VFR", value="VFR")],
@@ -2407,7 +2422,7 @@ async def vuelo(
     interaction: discord.Interaction,
     callsign: str, aircraft: str, salida: app_commands.Choice[str], llegada: app_commands.Choice[str],
     nivel: str, reglas: app_commands.Choice[str], alterno: app_commands.Choice[str],
-    squawk: str, observaciones: str, ruta: str = None,
+    squawk: str, ruta: str = None, observaciones: str = None,
 ):
     if interaction.channel_id != int(DISCORD_CHANNEL_VUELO_CMD):
         await interaction.response.send_message(
@@ -2684,12 +2699,13 @@ class AnuncioATCDashboardModal(discord.ui.Modal, title="Anuncio rápido a ATC"):
         if not DISCORD_CHANNEL_ATC:
             await interaction.followup.send("No hay un canal ATC configurado.", ephemeral=True)
             return
+        contenido = f"<@&{V_ROLE_ID}> {str(self.texto)}\n\n-# Publicado por {interaction.user.mention}"
         payload = {
             "flags": 32768,
-            "allowed_mentions": {"parse": [], "roles": [str(ATC_ROLE_ID)]},
+            "allowed_mentions": {"parse": [], "roles": [str(V_ROLE_ID)]},
             "components": [
                 {"type": 17, "accent_color": BRAND_BEACON_AMBER,
-                 "components": [{"type": 10, "content": f"<@&{ATC_ROLE_ID}> {str(self.texto)}"}]},
+                 "components": [{"type": 10, "content": contenido}]},
             ],
         }
         try:
@@ -2779,17 +2795,18 @@ class ATISModal2(discord.ui.Modal, title="ATIS (2/2) — nubes, QNH, RMKs"):
         if not DISCORD_CHANNEL_ATIS:
             await interaction.followup.send("No hay un canal de ATIS configurado.", ephemeral=True)
             return
-        payload = _construir_payload_atis({
-            "airport": fila["airport"], "ident": self.ident,
-            "at": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
-            "depRwy": self.pista_salida, "arrRwy": self.pista_llegada or self.pista_salida,
-            "wind": self.viento, "visibility": self.visibilidad,
-            "clouds": str(self.nubes), "qnh": str(self.qnh), "trl": str(self.nivel_transicion),
-            "remarks": str(self.rmks),
-        })
         try:
+            payload = _construir_payload_atis({
+                "airport": fila["airport"], "ident": self.ident,
+                "at": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
+                "depRwy": self.pista_salida, "arrRwy": self.pista_llegada or self.pista_salida,
+                "wind": self.viento, "visibility": self.visibilidad,
+                "clouds": str(self.nubes), "qnh": str(self.qnh), "trl": str(self.nivel_transicion),
+                "remarks": str(self.rmks),
+            })
             await _publicar_payload_crudo(int(DISCORD_CHANNEL_ATIS), payload)
         except Exception as err:
+            print(f"ERROR al publicar el ATIS de {self.atc_uuid}: {err}")
             await interaction.followup.send(f"No pude publicar el ATIS: {err}", ephemeral=True)
             return
         await interaction.followup.send(f"ATIS {fila['airport']} {self.ident} publicado. ✅", ephemeral=True)
