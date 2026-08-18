@@ -173,6 +173,18 @@ async def sesiones_para_recordar(conn: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def sessions_for_user(conn: aiosqlite.Connection, user_id: str, *, limit: int = 25) -> list[dict]:
+    """Sesiones a las que un alumno se anotó (cualquier estado) — para la
+    sección "Mis lecciones" de /academia."""
+    cur = await conn.execute(
+        """SELECT s.* FROM academy_sessions s
+           JOIN academy_session_signups su ON su.session_uuid = s.uuid
+           WHERE su.user_id = ? ORDER BY s.scheduled_at DESC LIMIT ?""",
+        (user_id, limit),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
 async def marcar_recordatorio_enviado(conn: aiosqlite.Connection, session_uuid: str) -> None:
     await conn.execute(
         "UPDATE academy_sessions SET reminder_sent_at = ? WHERE uuid = ?", (_now_ms(), session_uuid)

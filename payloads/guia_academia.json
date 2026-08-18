@@ -1,0 +1,136 @@
+{
+  "flags": 32768,
+  "allowed_mentions": {
+    "parse": []
+  },
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 16757760,
+      "components": [
+        {
+          "type": 10,
+          "content": "# 🎓 GUÍA COMPLETA — CÓMO USAR /academia"
+        },
+        {
+          "type": 10,
+          "content": "Esta guía explica **todo**, paso a paso, sin dar nada por sabido. No hace falta saber nada de antes — seguí los pasos en orden.\n\n## ¿Qué es Academia?\n\nEs el sistema de formación de ATC24 Español. Ahí te convertís en Piloto, Controlador de Tráfico Aéreo (ATC) o Equipo de Tierra: elegís una rama, tomás clases con un instructor, te evalúan, y si aprobás, te dan un certificado y avanzás al siguiente nivel.\n\nTodo se maneja con el comando **/academia** y con paneles fijos que hay en el canal de Academia — no hace falta memorizar nada, siempre podés volver a escribir /academia para ver el menú de nuevo."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 16757760,
+      "components": [
+        {
+          "type": 10,
+          "content": "## PASO 1 — Escribí /academia\n\nEscribí **/academia** en cualquier canal y elegí el comando cuando te lo sugiera Discord (tiene que aparecer el ícono del bot al lado). Se te va a abrir un mensaje privado (solo lo ves vos) con varios botones."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## PASO 2 — Botón \"Elegir rama\"\n\nEste es tu primer paso siempre. Al presionarlo aparece un menú desplegable con tres opciones:\n\n**✈️ Piloto** — si querés volar aviones dentro del servidor.\n**🛫 Controlador de Tráfico Aéreo (ATC)** — si querés controlar el tráfico aéreo, dar autorizaciones, manejar torres/centros.\n**🧰 Equipo de Tierra** — si querés trabajar en tareas de tierra (asistencia a aeronaves, logística de aeropuerto).\n\nElegí **una sola** (la que más te interese) y confirmá."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## PASO 3 — Esperar la aprobación\n\nDespués de elegir tu rama, tu solicitud queda **pendiente**. Un instructor tiene que revisarla y aprobarla a mano — no es automático, así que puede tardar un rato (no minutos, puede ser horas). No hace falta que hagas nada más, solo esperar.\n\nSi volvés a intentar \"Elegir rama\" mientras está pendiente, el bot te va a avisar que ya tenés una solicitud en camino — es normal, no es un error.\n\n## PASO 4 — Te aprueban, se desbloquea tu primer curso\n\nCuando un instructor aprueba tu solicitud, se te desbloquea automáticamente el **primer curso** de tu rama. Podés ver esto en cualquier momento con el botón **\"Mi progreso\"** de /academia."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 16757760,
+      "components": [
+        {
+          "type": 10,
+          "content": "## PASO 5 — Anotarte a una clase\n\nAhora tenés que asistir a clases. Andá al **canal de Academia** — ahí siempre hay un mensaje fijo llamado **\"ATC24 Español — Sesiones de Academia\"** que se actualiza solo, con dos secciones:\n\n**🔴 En vivo ahora** — clases que están pasando en este momento.\n**🗓️ Agendadas** — clases que van a empezar más tarde.\n\nBuscá una clase de tu rama y fijate el botón verde **Unirse** que tiene su propio mensaje. **Podés anotarte apenas la ves agendada — no hace falta esperar a que empiece.** Te confirma por mensaje privado que quedaste anotado.\n\n¿No hay ninguna que te sirva? Usá **\"Solicitar una sesión\"** en el mismo panel: elegís tu rating y la solicitud pasa a los instructores, que la reclaman y te confirman antes de armar la clase.\n\n¿No podés ir? El botón **Salir** te saca de la lista sin problema."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 16757760,
+      "components": [
+        {
+          "type": 10,
+          "content": "## PASO 6 — La clase empieza\n\nCuando llega la hora agendada, el mismo mensaje cambia solo de \"agendada\" a **\"en curso\"** — no hace falta hacer nada. Ahí es cuando tenés que estar presente. El botón **Ver alumnos** te muestra quién más está anotado."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## PASO 7 — Después de la clase: el instructor te aprueba\n\n**Este paso lo hace el instructor, no vos.** Después de dar la clase, tu instructor te marca como \"listo\" desde su panel (\"Aprobar alumnos\"). Recién ahí tu curso pasa a **\"disponible para evaluación\"**. Si terminaste la clase y no ves cambios, no es un error — puede que todavía no te haya marcado."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## PASO 8 — La evaluación\n\nUna vez \"disponible para evaluación\", quedás en la **Cola de Academia**. Un instructor te evalúa con una rúbrica de **10 criterios** (1 a 10 puntos cada uno, 100 en total) — necesitás **75 o más** para aprobar. Si no apruebas, no pasa nada grave: podés reintentarlo más adelante.\n\n## PASO 9 — Tu certificado\n\nSi aprobaste, te llega por **mensaje privado** una imagen de tu certificado con código de verificación único. Vas a poder verlos todos con **\"Mis certificados\"**. Si tu rama tiene más cursos, el siguiente se desbloquea solo — volvés al Paso 5."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 16757760,
+      "components": [
+        {
+          "type": 10,
+          "content": "## Resumen — botones de /academia (alumnos)\n\n**Elegir rama** — pedir tu inscripción (Paso 2).\n**Mi progreso** — en qué curso estás y en qué estado.\n**Mis lecciones** — a qué clases te anotaste, y su estado.\n**Mis certificados** — todos los que ya obtuviste."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "## Preguntas frecuentes\n\n**\"Elegí rama pero no pasa nada\"** — normal, queda pendiente hasta que un instructor la apruebe.\n\n**\"Me anoté pero no me llegó nada\"** — revisá que tengas los mensajes directos abiertos para el bot (Configuración de privacidad del servidor).\n\n**\"Terminé la clase pero mi progreso sigue igual\"** — tu instructor todavía no te aprobó (Paso 7), es una acción manual suya.\n\n**\"¿Cuántas veces puedo repetir una evaluación?\"** — las que necesites, no hay límite fijo."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 730437,
+      "components": [
+        {
+          "type": 10,
+          "content": "## Para instructores y Staff\n\n**Cola de evaluaciones** — aprobar/rechazar inscripciones nuevas, y calificar evaluaciones disponibles con la rúbrica de 10 criterios.\n\n**Agendar sesión** — rama, tema, en cuántos minutos empieza y cupo máximo (default 5). Se publica sola apenas la agendás.\n\n**Panel de instructor** — Atrasar/Adelantar 15 min, Iniciar ahora, Cancelar, Cerrar (completar), Anunciar (se autoborra a los 5 min)."
+        },
+        {
+          "type": 14,
+          "divider": true,
+          "spacing": 1
+        },
+        {
+          "type": 10,
+          "content": "### El botón que no hay que olvidar: Aprobar alumnos\n\nUn alumno **no pasa solo** a la cola de evaluaciones por más que haya ido a tu clase — vos tenés que aprobarlo. Desde tu **Panel de instructor**, elegí la sesión y usá **Aprobar alumnos**: elegís de la lista de anotados a quién ya está listo, y su curso actual en esa rama pasa a \"disponible para evaluación\". Recién ahí aparece en la Cola de Academia."
+        }
+      ]
+    },
+    {
+      "type": 17,
+      "accent_color": 730437,
+      "components": [
+        {
+          "type": 10,
+          "content": "-# ¿Dudas que esta guía no responde? Escribe **!help**, o abrí un ticket desde el panel de soporte."
+        }
+      ]
+    }
+  ]
+}

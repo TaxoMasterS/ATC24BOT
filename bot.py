@@ -247,6 +247,11 @@ E = {
 
 V_ROLE_ID  = 1508568101770367156   # V  | Verificado
 NV_ROLE_ID = 1532919695827665057   # NV | No Verificado
+# Rol gestionado por Bloxlink al vincular la cuenta de Roblox — independiente
+# de V (verificación del servidor). A quien lo tiene se le permite volar
+# (/vuelo + hablar en las frecuencias de ATC) sin necesidad de tener un
+# rating de Piloto todavía, a pedido explícito.
+VERIFICADO_ROBLOX_ROLE_ID = 1535396840504299694
 
 FLT_ROLE_ID = 1238796825381834760   # FLT | Piloto (rol base)
 ATC_ROLE_ID = 1532224008555204669   # ATC | Controlador de Tráfico Aéreo (rol base)
@@ -259,6 +264,7 @@ ARCHIVO_GUIA = os.path.join(CARPETA_SCRIPT, "payloads", "guia.json")
 ARCHIVO_GUIA_BLOXLINK = os.path.join(CARPETA_SCRIPT, "payloads", "guia_bloxlink.json")
 ARCHIVO_GUIA_VUELO = os.path.join(CARPETA_SCRIPT, "payloads", "guia_plan_vuelo.json")
 ARCHIVO_GUIA_ATIS = os.path.join(CARPETA_SCRIPT, "payloads", "guia_atis.json")
+ARCHIVO_GUIA_ACADEMIA = os.path.join(CARPETA_SCRIPT, "payloads", "guia_academia.json")
 
 # ─── Jerarquía de roles y prefijos (guía oficial de ATC24 Español) ────────
 # Cada lista va del rango MÁS ALTO al más bajo dentro de su categoría.
@@ -687,6 +693,44 @@ def aplicar_imagen_formal_determinista(embed: discord.Embed, semilla) -> discord
         embed.set_image(url=f"attachment://{archivo.filename}")
     return archivo
 
+
+def _embed_a_layoutview(embed: discord.Embed, archivo: discord.File | None) -> discord.ui.LayoutView:
+    """Convierte un discord.Embed ya armado (título, descripción, campos,
+    footer, color) en un LayoutView de Components V2 con DOS contenedores
+    separados — uno solo con la imagen formal, otro solo con el texto — en
+    vez del formato clásico donde la imagen vive pegada al mismo bloque que
+    el texto. No cambia cómo se arma el contenido en cada sitio (se sigue
+    usando discord.Embed con add_field como siempre); solo cambia cómo se
+    envía. Sin botones — para eso hace falta una LayoutView propia con la
+    vista original incorporada (ver los paneles con botones, que quedan
+    aparte)."""
+    color = embed.colour.value if embed.colour else BRAND_SKY_NAVY
+    vista = discord.ui.LayoutView()
+    if archivo:
+        vista.add_item(discord.ui.Container(
+            discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{archivo.filename}")),
+            accent_color=color,
+        ))
+    hijos_texto = []
+    encabezado = []
+    if embed.title:
+        encabezado.append(f"# {embed.title}")
+    if embed.description:
+        encabezado.append(embed.description)
+    if encabezado:
+        hijos_texto.append(discord.ui.TextDisplay("\n".join(encabezado)))
+    for campo in embed.fields:
+        if hijos_texto:
+            hijos_texto.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        hijos_texto.append(discord.ui.TextDisplay(f"**{campo.name}**\n{campo.value}"))
+    if embed.footer and embed.footer.text:
+        hijos_texto.append(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        hijos_texto.append(discord.ui.TextDisplay(f"-# {embed.footer.text}"))
+    if not hijos_texto:
+        hijos_texto.append(discord.ui.TextDisplay("​"))  # un contenedor no puede quedar sin hijos
+    vista.add_item(discord.ui.Container(*hijos_texto, accent_color=color))
+    return vista
+
 COURSE_STATE_LABEL = {
     "locked": f"{E['cruz']} Bloqueado",
     "in_progress": f"{E['libro']} En progreso",
@@ -932,16 +976,23 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         print(f"Aviso: no pude actualizar el panel de nominadas de foto de la semana: {err}")
 
 
-def _construir_payload_nominadas_foto_semana(nominadas: list) -> dict:
+# Semilla fija — es un único panel permanente, así que la variante de
+# imagen queda fija en vez de recalcularse distinta en cada edición.
+_SEMILLA_PANEL_NOMINADAS_FOTO_SEMANA = "panel_nominadas_foto_semana"
+
+
+def _construir_payload_nominadas_foto_semana(nominadas: list) -> tuple[dict, str | None]:
     """Panel fijo que se edita in-place cada vez que se nomina una foto
-    nueva — muestra la lista numerada con el link al mensaje original y una
-    galería con todas las imágenes nominadas, para que se vea de un vistazo
-    quién nominó qué sin tener que ir a buscar cada mensaje."""
+    nueva. Formato de DOS contenedores separados (mismo patrón que la
+    bienvenida): el primero es solo la imagen general de identidad de
+    ATC24, el segundo es puro texto con la lista numerada y el hyperlink al
+    mensaje original de cada nominada — nunca la imagen nominada en sí
+    (metida dentro de un Media Gallery salía recortada)."""
     if not nominadas:
         cuerpo = "_Todavía no hay ninguna foto nominada esta semana. Reacciona con ⭐ a una foto para nominarla._"
     else:
         lineas = [
-            f"**{i}.** [{('Ver foto')}]({n['jump_url']}) — <@{n['author_id']}>"
+            f"**{i}.** <@{n['author_id']}> — [Ver foto]({n['jump_url']})"
             for i, n in enumerate(nominadas, start=1)
         ]
         cuerpo = "\n".join(lineas)
@@ -949,23 +1000,24 @@ def _construir_payload_nominadas_foto_semana(nominadas: list) -> dict:
             faltan = 3 - len(nominadas)
             cuerpo += f"\n\n_Hacen falta {_plural(faltan, 'nominada más', 'nominadas más')} para abrir la votación el viernes._"
 
-    componentes = [
-        {"type": 10, "content": "# ⭐ Nominadas de la semana"},
-        {"type": 14, "divider": True, "spacing": 1},
-        {"type": 10, "content": cuerpo},
-    ]
-    if nominadas:
-        # Media Gallery admite hasta 10 items — con más de 10 nominadas se
-        # muestran las primeras 10 imágenes, pero la lista de texto de
-        # arriba sigue completa.
-        items = [{"media": {"url": n["imagen_url"]}} for n in nominadas[:10]]
-        componentes.append({"type": 12, "items": items})
+    contenedores = []
+    nombre_banner = _nombre_imagen_formal_determinista(_SEMILLA_PANEL_NOMINADAS_FOTO_SEMANA)
+    if nombre_banner:
+        contenedores.append({
+            "type": 17, "accent_color": BRAND_BEACON_AMBER,
+            "components": [{"type": 12, "items": [{"media": {"url": f"attachment://{nombre_banner}"}}]}],
+        })
+    contenedores.append({
+        "type": 17, "accent_color": BRAND_BEACON_AMBER,
+        "components": [
+            {"type": 10, "content": "# ⭐ Nominadas de la semana"},
+            {"type": 14, "divider": True, "spacing": 1},
+            {"type": 10, "content": cuerpo},
+        ],
+    })
 
-    return {
-        "flags": 32768,
-        "allowed_mentions": {"parse": []},
-        "components": [{"type": 17, "accent_color": BRAND_BEACON_AMBER, "components": componentes}],
-    }
+    payload = {"flags": 32768, "allowed_mentions": {"parse": []}, "components": contenedores}
+    return payload, nombre_banner
 
 
 async def _actualizar_panel_nominadas_foto_semana() -> None:
@@ -974,7 +1026,7 @@ async def _actualizar_panel_nominadas_foto_semana() -> None:
     in-place alcanza."""
     if not DISCORD_CHANNEL_FOTO_SEMANA:
         return
-    payload = _construir_payload_nominadas_foto_semana(_estado_foto_semana["nominadas"])
+    payload, nombre_banner = _construir_payload_nominadas_foto_semana(_estado_foto_semana["nominadas"])
     message_id = await bot_state.get(db, "foto_semana_nominadas_message_id")
     headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
 
@@ -989,6 +1041,18 @@ async def _actualizar_panel_nominadas_foto_semana() -> None:
             print(f"Aviso: no pude editar el panel de nominadas de foto de la semana: {status} {texto or data}")
             return
         await bot_state.set(db, "foto_semana_nominadas_message_id", None)  # lo borraron a mano
+
+    if nombre_banner:
+        ruta = os.path.join(CARPETA_SCRIPT, "assets", nombre_banner)
+        if os.path.exists(ruta):
+            try:
+                data = await _publicar_payload_con_archivo(
+                    int(DISCORD_CHANNEL_FOTO_SEMANA), payload, ruta_archivo=ruta, nombre_archivo=nombre_banner
+                )
+                await bot_state.set(db, "foto_semana_nominadas_message_id", data["id"])
+                return
+            except Exception as err:
+                print(f"Aviso: no pude publicar el panel de nominadas con banner, lo mando sin imagen: {err}")
 
     status, data, texto = await _discord_request(
         "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_FOTO_SEMANA}/messages",
@@ -2265,6 +2329,63 @@ class PanelInstructorAccionView(discord.ui.View):
     async def anunciar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AnuncioSesionModal(self.sesion))
 
+    @discord.ui.button(label="Aprobar alumnos", style=discord.ButtonStyle.success, emoji="🎓", row=2)
+    async def aprobar_alumnos_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Eslabón que faltaba en el flujo de Academia: esto es lo único que
+        # mueve a un alumno de "asistió a la clase" a "disponible para
+        # evaluación" — sin esto, la Cola de Academia nunca tenía nada.
+        alumnos = await sessions_core.list_signups(db, self.sesion["uuid"])
+        if not alumnos:
+            await interaction.response.send_message("Todavía no hay alumnos anotados en esta sesión.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Elige a quién aprobar para pasar a evaluación:", view=AprobarAlumnosView(self.sesion, alumnos), ephemeral=True,
+        )
+
+
+class AprobarAlumnoSelect(discord.ui.Select):
+    def __init__(self, sesion: dict, alumnos: list[str]):
+        self.sesion = sesion
+        opciones = [discord.SelectOption(label=f"Alumno {uid}", value=uid) for uid in alumnos[:25]]
+        super().__init__(placeholder="Elige el alumno a aprobar…", options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = self.values[0]
+        rama = _RATING_A_RAMA.get(self.sesion["category"])
+        if not rama:
+            await interaction.response.send_message(
+                f"No reconozco \"{self.sesion['category']}\" como un rating de ninguna rama — no puedo determinar "
+                "qué curso aprobar.", ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        resultado = await academy_core.mark_ready_for_evaluation(db, user_id, rama)
+        if not resultado:
+            await interaction.followup.send(
+                f"<@{user_id}> no tiene ningún curso en progreso en la rama {BRANCH_LABEL.get(rama, rama)} ahora mismo.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"<@{user_id}> queda disponible para evaluación de **{resultado['courseTitle']}** — ya aparece en la "
+            "Cola de Academia. ✅",
+            ephemeral=True,
+        )
+        try:
+            alumno = await client.fetch_user(int(user_id))
+            await alumno.send(
+                f"Tu instructor te aprobó para pasar a la evaluación de **{resultado['courseTitle']}**. "
+                "Un instructor te va a evaluar pronto."
+            )
+        except (discord.Forbidden, discord.NotFound):
+            pass
+
+
+class AprobarAlumnosView(discord.ui.View):
+    def __init__(self, sesion: dict, alumnos: list[str]):
+        super().__init__(timeout=180)
+        self.add_item(AprobarAlumnoSelect(sesion, alumnos))
+
 
 class SesionInstructorSelect(discord.ui.Select):
     def __init__(self, sesiones: list):
@@ -2293,6 +2414,40 @@ class PanelInstructorView(discord.ui.View):
             self.add_item(SesionInstructorSelect(sesiones))
 
 
+class ElegirRamaSelect(discord.ui.Select):
+    def __init__(self):
+        opciones = [
+            discord.SelectOption(label="Piloto", value="pilot", description="Piloto Privado / Comercial de Avión", emoji="✈️"),
+            discord.SelectOption(label="Controlador de Tráfico Aéreo", value="atc", description="ATC", emoji="🛫"),
+            discord.SelectOption(label="Equipo de Tierra", value="gc", description="Ground Crew", emoji="🧰"),
+        ]
+        super().__init__(placeholder="Elige tu rama…", options=opciones)
+
+    async def callback(self, interaction: discord.Interaction):
+        rama = self.values[0]
+        existente = await academy_core.find_active_enrollment(db, str(interaction.user.id), rama)
+        if existente:
+            estado_txt = {
+                "pending": "está pendiente de que un instructor la revise",
+                "approved": "ya fue aprobada — no hace falta pedirla de nuevo",
+            }.get(existente["state"], existente["state"])
+            await interaction.response.send_message(
+                f"Ya tenés una inscripción a **{BRANCH_LABEL.get(rama, rama)}** que {estado_txt}.", ephemeral=True
+            )
+            return
+        await academy_core.request_enrollment(db, str(interaction.user.id), rama)
+        await interaction.response.send_message(
+            f"Solicitud enviada para **{BRANCH_LABEL.get(rama, rama)}**. Un instructor la va a revisar pronto. ✅",
+            ephemeral=True,
+        )
+
+
+class ElegirRamaView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(ElegirRamaSelect())
+
+
 class AcademiaView(discord.ui.View):
     def __init__(self, invocador: discord.Member):
         super().__init__(timeout=180)
@@ -2302,6 +2457,12 @@ class AcademiaView(discord.ui.View):
             self.remove_item(self.agendar_btn)
             self.remove_item(self.panel_instructor_btn)
 
+    @discord.ui.button(label="Elegir rama", style=discord.ButtonStyle.success, emoji="🧭")
+    async def elegir_rama_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "¿A qué rama querés inscribirte?", view=ElegirRamaView(), ephemeral=True,
+        )
+
     @discord.ui.button(label="Mi progreso", style=discord.ButtonStyle.primary, emoji="📚")
     async def progreso_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
@@ -2310,6 +2471,24 @@ class AcademiaView(discord.ui.View):
         except Exception as err:
             await interaction.followup.send(f"No pude consultar tu progreso: {err}", ephemeral=True)
             return
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Mis lecciones", style=discord.ButtonStyle.primary, emoji="🗓️")
+    async def lecciones_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        sesiones = await sessions_core.sessions_for_user(db, str(interaction.user.id))
+        if not sesiones:
+            await interaction.followup.send("Todavía no te anotaste a ninguna clase — usa **Solicitar una sesión** en el panel del canal de Academia.", ephemeral=True)
+            return
+        estado_label = {"scheduled": "Agendada", "live": "🔴 En vivo", "completed": "Completada", "cancelled": "Cancelada"}
+        embed = discord.Embed(title="Tus lecciones", color=BRAND_RADAR_GREEN)
+        for s in sesiones[:10]:
+            ts = int(s["scheduled_at"] / 1000)
+            embed.add_field(
+                name=f"{s['course_title']} ({s['category']})",
+                value=f"{estado_label.get(s['state'], s['state'])} — <t:{ts}:R>",
+                inline=False,
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Mis certificados", style=discord.ButtonStyle.success, emoji="🎓")
@@ -2686,6 +2865,11 @@ async def _crear_canal_atc(fila: dict) -> tuple[str | None, str | None]:
         flt_role = guild.get_role(FLT_ROLE_ID)
         if flt_role:
             overwrites[flt_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        roblox_role = guild.get_role(VERIFICADO_ROBLOX_ROLE_ID)
+        if roblox_role:
+            # Puede volar (hablar en la frecuencia) sin tener rating de
+            # Piloto todavía — solo con estar verificado con Roblox.
+            overwrites[roblox_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         atc_role = guild.get_role(ATC_ROLE_ID)
         if atc_role:
             overwrites[atc_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
@@ -3201,10 +3385,11 @@ async def rankings(interaction: discord.Interaction):
     _campo("Controladores con más minutos en posición", controladores, "Todavía no hay posiciones ATC cerradas.")
     _campo("Actividad total (vuelos + control)", actividad, "Todavía no hay actividad registrada.")
     archivo = await aplicar_imagen_formal(embed)
+    vista = _embed_a_layoutview(embed, archivo)
     if archivo:
-        await interaction.followup.send(embed=embed, file=archivo)
+        await interaction.followup.send(view=vista, file=archivo)
     else:
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(view=vista)
 
 
 @tree.command(name="servidor", description="Muestra el estado en vivo de la red: vuelos, controladores y verificados")
@@ -3222,10 +3407,11 @@ async def servidor(interaction: discord.Interaction):
     embed.add_field(name="Controladores en línea", value=str(len(posiciones)), inline=True)
     embed.add_field(name="Verificados", value=f"{verificados} / {totales}", inline=True)
     archivo = await aplicar_imagen_formal(embed)
+    vista = _embed_a_layoutview(embed, archivo)
     if archivo:
-        await interaction.followup.send(embed=embed, file=archivo)
+        await interaction.followup.send(view=vista, file=archivo)
     else:
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(view=vista)
 
 
 @tree.command(name="certificado-verificar", description="Comprueba la autenticidad de un certificado por su código")
@@ -3299,10 +3485,11 @@ async def _registrar_caso_moderacion(*, miembro: discord.abc.User, moderador: di
                 embed_log.add_field(name="Duración", value=f"{duracion_minutos} min", inline=True)
             embed_log.add_field(name="Motivo", value=motivo or "—", inline=False)
             archivo = await aplicar_imagen_formal(embed_log)
+            vista = _embed_a_layoutview(embed_log, archivo)
             if archivo:
-                await canal_log.send(embed=embed_log, file=archivo)
+                await canal_log.send(view=vista, file=archivo)
             else:
-                await canal_log.send(embed=embed_log)
+                await canal_log.send(view=vista)
     return caso
 
 
@@ -3328,10 +3515,11 @@ class ApelacionModal(discord.ui.Modal, title="Apelar una sanción"):
         embed.add_field(name="Usuario", value=f"{interaction.user} ({interaction.user.id})", inline=False)
         embed.add_field(name="Explicación", value=str(self.motivo), inline=False)
         archivo = await aplicar_imagen_formal(embed)
+        vista = _embed_a_layoutview(embed, archivo)
         if archivo:
-            await canal.send(embed=embed, file=archivo)
+            await canal.send(view=vista, file=archivo)
         else:
-            await canal.send(embed=embed)
+            await canal.send(view=vista)
         await interaction.followup.send(
             "Tu apelación fue enviada al Staff. Vas a recibir una respuesta a la brevedad.", ephemeral=True
         )
@@ -3543,10 +3731,11 @@ async def advertencias(interaction: discord.Interaction, usuario: discord.Member
     if len(casos) > 20:
         embed.set_footer(text="Se muestran únicamente los casos más recientes de cada categoría.")
     archivo = await aplicar_imagen_formal(embed)
+    vista = _embed_a_layoutview(embed, archivo)
     if archivo:
-        await interaction.followup.send(embed=embed, file=archivo, ephemeral=True)
+        await interaction.followup.send(view=vista, file=archivo, ephemeral=True)
     else:
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(view=vista, ephemeral=True)
 
 
 class ModPanelRevocarSelect(discord.ui.Select):
@@ -3780,10 +3969,11 @@ class StaffDashboardView(discord.ui.View):
     async def reglas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(title="Reglas de Staff", description=REGLAS_STAFF_TEXTO, color=BRAND_SKY_NAVY)
         archivo = await aplicar_imagen_formal(embed)
+        vista = _embed_a_layoutview(embed, archivo)
         if archivo:
-            await interaction.response.send_message(embed=embed, file=archivo, ephemeral=True)
+            await interaction.response.send_message(view=vista, file=archivo, ephemeral=True)
         else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(view=vista, ephemeral=True)
 
 
 async def _embed_dashboard_staff() -> tuple[discord.Embed, discord.File | None]:
@@ -4370,13 +4560,21 @@ def _construir_payload_tabla_atc(activos: list):
                                 "label": "Solicitar apertura de posición",
                                 "custom_id": SOLICITAR_CONTROL_CUSTOM_ID,
                             },
-                            {
-                                "type": 2,
-                                "style": 5,  # link — no lleva custom_id, lleva url
-                                "label": "Unirse al servidor",
-                                "url": LINK_SERVIDOR_ROBLOX,
-                            },
                         ],
+                    },
+                ],
+            },
+            # Fila de botones AFUERA del contenedor a propósito — un action
+            # row al mismo nivel que el contenedor (no adentro de sus
+            # "components") se renderiza por fuera del recuadro con borde.
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 5,  # link — no lleva custom_id, lleva url
+                        "label": "Unirse al servidor",
+                        "url": LINK_SERVIDOR_ROBLOX,
                     },
                 ],
             },
@@ -5320,6 +5518,7 @@ COMANDOS_PUBLICAR = {
     "!publicar-guia-bloxlink": ARCHIVO_GUIA_BLOXLINK,
     "!publicar-guia-vuelo": ARCHIVO_GUIA_VUELO,
     "!publicar-guia-atis": ARCHIVO_GUIA_ATIS,
+    "!publicar-guia-academia": ARCHIVO_GUIA_ACADEMIA,
 }
 
 
@@ -5596,10 +5795,17 @@ AYUDA_SECCIONES = {
         "descripcion": "Clases agendadas, solicitudes de sesión y evaluaciones.",
         "campos": [
             (
+                "Elegir rama y progreso",
+                "\"Elegir rama\" en `/academia` te inscribe (Piloto, ATC o Equipo de Tierra) — queda pendiente de "
+                "que un instructor la apruebe, y ahí se te desbloquea el primer curso. \"Mi progreso\" y \"Mis "
+                "lecciones\" muestran en qué vas y a qué clases te anotaste.",
+            ),
+            (
                 "Clases programadas",
                 "El panel de sesiones agendadas se actualiza solo y agrupa las clases por categoría. El botón "
                 "\"Solicitar sesión\" abre un selector de rating: la solicitud pasa a un instructor disponible, que "
-                "la reclama y confirma contigo antes de crear la sesión y el canal de voz.",
+                "la reclama y confirma contigo antes de crear la sesión y el canal de voz. Podés anotarte desde "
+                "que se agenda, no hace falta esperar a que empiece.",
             ),
             (
                 "Sesiones en vivo",
@@ -5609,7 +5815,8 @@ AYUDA_SECCIONES = {
             (
                 "Instructores y Staff",
                 "Desde `/academia` se accede además al panel de instructor (atrasar, adelantar, iniciar, cancelar, "
-                "cerrar o anunciar tus propias sesiones) y a la cola de evaluaciones, con una rúbrica de 10 "
+                "cerrar, anunciar o **aprobar alumnos** de tus propias sesiones — este último botón es lo que hace "
+                "que un alumno pase a la cola de evaluaciones) y a la cola de evaluaciones, con una rúbrica de 10 "
                 "criterios por rango. Al aprobar, se entrega un certificado con código de verificación por "
                 "mensaje directo.",
             ),
@@ -5674,7 +5881,8 @@ AYUDA_SECCIONES = {
                 "**!staff** — publica el Dashboard de Staff permanente\n"
                 "**!panel-soporte** — publica el panel fijo de tickets de soporte\n"
                 "**!publicar-verificacion / !publicar-guia / !publicar-guia-bloxlink / !publicar-guia-vuelo / "
-                "!publicar-guia-atis** — publican los JSON fijos de payloads/ (se autoborran)\n"
+                "!publicar-guia-atis / !publicar-guia-academia** — publican los JSON fijos de payloads/ (se "
+                "autoborran)\n"
                 "**!autorizar** — arma/desarma la captura de autorización de vuelo en el canal actual; oculto a "
                 "propósito, solo administradores o rol ATC",
             ),

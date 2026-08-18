@@ -315,6 +315,28 @@ async def pending_evaluations(conn: aiosqlite.Connection, branch: str | None = N
     ]
 
 
+async def mark_ready_for_evaluation(conn: aiosqlite.Connection, user_id: str, branch: str) -> dict | None:
+    """El instructor aprueba que un alumno ya dio la lección/clase y puede
+    pasar a evaluación — busca el curso que el alumno tiene en progreso en
+    esa rama ahora mismo y lo pone eval_state='available' (ahí lo recoge la
+    Cola de Academia). Devuelve None si no hay ningún curso en progreso en
+    esa rama para ese alumno."""
+    cur = await conn.execute(
+        """SELECT cp.* FROM academy_course_progress cp
+           JOIN academy_courses c ON c.uuid = cp.course_uuid
+           WHERE cp.user_id = ? AND c.branch = ? AND cp.state = 'in_progress'
+           ORDER BY cp.updated_at DESC LIMIT 1""",
+        (user_id, branch),
+    )
+    fila = await cur.fetchone()
+    if not fila:
+        return None
+    await _upsert_course_progress(conn, user_id, fila["course_uuid"], eval_state="available")
+    cur2 = await conn.execute("SELECT title FROM academy_courses WHERE uuid = ?", (fila["course_uuid"],))
+    curso = await cur2.fetchone()
+    return {"courseUuid": fila["course_uuid"], "courseTitle": curso["title"] if curso else None}
+
+
 async def resolve_evaluation(conn: aiosqlite.Connection, user_id: str, course_uuid: str, approve: bool,
                               approver_id: str) -> dict | None:
     cur = await conn.execute(
