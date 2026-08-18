@@ -1346,6 +1346,11 @@ async def _refrescar_dashboards_en_vivo() -> list[str]:
         refrescados.append("Nominadas de Foto de la Semana")
     except Exception as err:
         print(f"Aviso: no pude refrescar el panel de nominadas de Foto de la Semana: {err}")
+    try:
+        await _actualizar_dashboard_cola_academia()
+        refrescados.append("Cola de Academia (evaluaciones pendientes)")
+    except Exception as err:
+        print(f"Aviso: no pude refrescar el dashboard de cola de Academia: {err}")
     return refrescados
 
 
@@ -1891,6 +1896,112 @@ async def _embed_cola(rama_valor=None):
     return embed, None, evaluaciones, inscripciones
 
 
+# ─── Dashboard fijo de "Evaluaciones pendientes por aprobar" ──────────────
+# Panel siempre presente en el canal de solicitudes de clase (no depende de
+# que un instructor se acuerde de abrir /academia) — se actualiza solo cada
+# vez que cambia algo en la cola: nueva inscripción, inscripción resuelta,
+# alumno desbloqueado para evaluación, o evaluación calificada/rechazada.
+_SEMILLA_PANEL_COLA_ACADEMIA = "panel_cola_academia"
+ABRIR_COLA_ACADEMIA_CUSTOM_ID = "academia_cola:abrir"
+
+
+def _construir_payload_cola_academia(evaluaciones: list, inscripciones: list) -> tuple[dict, str | None]:
+    if not evaluaciones and not inscripciones:
+        cuerpo = f"{E['check']} No hay nada pendiente de revisar ahora mismo."
+    else:
+        lineas = []
+        if inscripciones:
+            por_rama = _agrupar_por_rama(inscripciones)
+            for r in BRANCH_ORDER:
+                pendientes = por_rama.get(r, [])
+                if not pendientes:
+                    continue
+                lineas.append(f"**{BRANCH_LABEL[r]} · Inscripciones nuevas** ({len(pendientes)})")
+                lineas.extend(f"• <@{it['user_id']}>" for it in pendientes)
+        if evaluaciones:
+            por_rama = _agrupar_por_rama(evaluaciones)
+            for r in BRANCH_ORDER:
+                pendientes = por_rama.get(r, [])
+                if not pendientes:
+                    continue
+                lineas.append(f"**{BRANCH_LABEL[r]} · Evaluaciones** ({len(pendientes)})")
+                lineas.extend(
+                    f"• <@{it['userId']}> — {it['courseTitle']} ({EVAL_STATE_LABEL.get(it['evalState'], it['evalState'])})"
+                    for it in pendientes
+                )
+        cuerpo = "\n".join(lineas)
+
+    contenedores = []
+    nombre_banner = _nombre_imagen_formal_determinista(_SEMILLA_PANEL_COLA_ACADEMIA)
+    if nombre_banner:
+        contenedores.append({
+            "type": 17, "accent_color": BRAND_BEACON_AMBER,
+            "components": [{"type": 12, "items": [{"media": {"url": f"attachment://{nombre_banner}"}}]}],
+        })
+    contenedores.append({
+        "type": 17, "accent_color": BRAND_BEACON_AMBER,
+        "components": [
+            {"type": 10, "content": "# 📋 Evaluaciones pendientes por aprobar"},
+            {"type": 14, "divider": True, "spacing": 1},
+            {"type": 10, "content": cuerpo},
+            {"type": 1, "components": [
+                {"type": 2, "style": 1, "label": "Abrir cola", "emoji": "📋", "custom_id": ABRIR_COLA_ACADEMIA_CUSTOM_ID},
+            ]},
+        ],
+    })
+    payload = {"flags": 32768, "allowed_mentions": {"parse": []}, "components": contenedores}
+    return payload, nombre_banner
+
+
+async def _actualizar_dashboard_cola_academia() -> None:
+    """Publica o edita el panel fijo — nunca deja pasar una excepción hacia
+    quien la llama, porque siempre se dispara DESPUÉS de que la acción real
+    (aprobar/rechazar/calificar) ya se confirmó al staff."""
+    if not DISCORD_CHANNEL_SOLICITUDES_CLASE:
+        return
+    try:
+        evaluaciones = await academy_core.pending_evaluations(db, None)
+        inscripciones = await academy_core.pending_enrollments(db, None)
+        payload, nombre_banner = _construir_payload_cola_academia(evaluaciones, inscripciones)
+        message_id = await bot_state.get(db, "cola_academia_dashboard_message_id")
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+
+        if message_id:
+            status, data, texto = await _discord_request(
+                "PATCH", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_SOLICITUDES_CLASE}/messages/{message_id}",
+                headers=headers, json_body=payload,
+            )
+            if status < 300:
+                return
+            if status != 404:
+                print(f"Aviso: no pude editar el dashboard de cola de Academia: {status} {texto or data}")
+                return
+            await bot_state.set(db, "cola_academia_dashboard_message_id", None)
+
+        if nombre_banner:
+            ruta = os.path.join(CARPETA_SCRIPT, "assets", nombre_banner)
+            if os.path.exists(ruta):
+                try:
+                    data = await _publicar_payload_con_archivo(
+                        int(DISCORD_CHANNEL_SOLICITUDES_CLASE), payload, ruta_archivo=ruta, nombre_archivo=nombre_banner
+                    )
+                    await bot_state.set(db, "cola_academia_dashboard_message_id", data["id"])
+                    return
+                except Exception as err:
+                    print(f"Aviso: no pude publicar el dashboard de cola de Academia con banner, lo mando sin imagen: {err}")
+
+        status, data, texto = await _discord_request(
+            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_SOLICITUDES_CLASE}/messages",
+            headers=headers, json_body=payload,
+        )
+        if status >= 300:
+            print(f"Aviso: no pude publicar el dashboard de cola de Academia: {status} {texto or data}")
+            return
+        await bot_state.set(db, "cola_academia_dashboard_message_id", data["id"])
+    except Exception as err:
+        print(f"ERROR al actualizar el dashboard de cola de Academia: {err!r}")
+
+
 class InscripcionAccionView(discord.ui.View):
     def __init__(self, enrollment_uuid: str):
         super().__init__(timeout=180)
@@ -1918,6 +2029,7 @@ class InscripcionAccionView(discord.ui.View):
                 await alumno.send(embed=embed)
         except Exception as err:
             print(f"Aviso: no pude mandar el DM de bienvenida de Academia a {fila['user_id']}: {err}")
+        await _actualizar_dashboard_cola_academia()
 
     @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, emoji="❌")
     async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1926,6 +2038,7 @@ class InscripcionAccionView(discord.ui.View):
             await interaction.response.send_message("Esa inscripción ya no está pendiente.", ephemeral=True)
             return
         await interaction.response.send_message(f"Inscripción rechazada para <@{fila['user_id']}>.", ephemeral=True)
+        await _actualizar_dashboard_cola_academia()
 
 
 def _nombre_visible(guild: "discord.Guild | None", user_id) -> str:
@@ -2040,6 +2153,7 @@ class EvaluacionModal2(discord.ui.Modal, title="Calificar (2/2)"):
             f"Evaluación calificada: <@{self.user_id}> quedó **{veredicto}** con {total}/{evaluation_criteria.PUNTAJE_MAXIMO}.",
             ephemeral=True,
         )
+        await _actualizar_dashboard_cola_academia()
 
 
 class EvaluacionModal1(discord.ui.Modal, title="Calificar (1/2)"):
@@ -2118,6 +2232,7 @@ class EvaluacionAccionView(discord.ui.View):
             await interaction.response.send_message("Esa evaluación ya no está pendiente.", ephemeral=True)
             return
         await interaction.response.send_message(f"Rechazado: <@{self.user_id}>. Puede volver a intentarlo.", ephemeral=True)
+        await _actualizar_dashboard_cola_academia()
 
 
 class EvaluacionesSelect(discord.ui.Select):
@@ -2477,6 +2592,8 @@ async def _desbloquear_evaluacion_para_sesion(sesion: dict) -> int:
             )
         except (discord.Forbidden, discord.NotFound):
             pass
+    if n:
+        await _actualizar_dashboard_cola_academia()
     return n
 
 
@@ -2533,6 +2650,7 @@ class ElegirRamaSelect(discord.ui.Select):
             f"Solicitud enviada para **{BRANCH_LABEL.get(rama, rama)}**. Un instructor la va a revisar pronto. ✅",
             ephemeral=True,
         )
+        await _actualizar_dashboard_cola_academia()
 
 
 class ElegirRamaView(discord.ui.View):
@@ -2541,23 +2659,106 @@ class ElegirRamaView(discord.ui.View):
         self.add_item(ElegirRamaSelect())
 
 
-class AcademiaView(discord.ui.View):
-    def __init__(self, invocador: discord.Member):
-        super().__init__(timeout=180)
-        if not _puede_ascender_alguna(invocador):
-            self.remove_item(self.ascender_btn)
-        if not es_staff_moderacion(invocador):
-            self.remove_item(self.agendar_btn)
-            self.remove_item(self.panel_instructor_btn)
+_ACADEMIA_SECCIONES = {
+    "alumno": {"etiqueta": "Alumno — rama, progreso, lecciones, certificados", "emoji": "🧭"},
+    "staff": {"etiqueta": "Instructor / Staff — evaluaciones, sesiones, ascensos", "emoji": "🧑‍🏫"},
+}
 
-    @discord.ui.button(label="Elegir rama", style=discord.ButtonStyle.success, emoji="🧭")
-    async def elegir_rama_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class AcademiaView(discord.ui.LayoutView):
+    """Menú principal de /academia — Components V2: banner + un menú
+    desplegable que elige la sección (Alumno / Instructor-Staff), y recién
+    ahí aparecen los botones de esa sección — en vez del amontonado plano
+    de la vista anterior."""
+
+    def __init__(self, invocador: discord.Member, nombre_banner: str | None = None, seccion: str = "alumno"):
+        super().__init__(timeout=180)
+        self.invocador = invocador
+        self.nombre_banner = nombre_banner
+        self.es_staff = es_staff_moderacion(invocador)
+        self.puede_ascender = _puede_ascender_alguna(invocador)
+        self.seccion = seccion if (seccion != "staff" or self.es_staff) else "alumno"
+
+        def boton(label: str, style: discord.ButtonStyle, emoji: str | None, callback) -> discord.ui.Button:
+            item = discord.ui.Button(label=label, style=style, emoji=emoji)
+            item.callback = callback
+            return item
+
+        opciones = [
+            discord.SelectOption(
+                label="Alumno", description=_ACADEMIA_SECCIONES["alumno"]["etiqueta"][:100],
+                value="alumno", emoji="🧭", default=(self.seccion == "alumno"),
+            )
+        ]
+        if self.es_staff:
+            opciones.append(discord.SelectOption(
+                label="Instructor / Staff", description=_ACADEMIA_SECCIONES["staff"]["etiqueta"][:100],
+                value="staff", emoji="🧑‍🏫", default=(self.seccion == "staff"),
+            ))
+        select = discord.ui.Select(placeholder="Elige una sección…", min_values=1, max_values=1, options=opciones)
+
+        async def _cambiar_seccion(interaction: discord.Interaction):
+            nueva = AcademiaView(self.invocador, self.nombre_banner, select.values[0])
+            await interaction.response.edit_message(view=nueva)
+
+        select.callback = _cambiar_seccion
+        fila_select = discord.ui.ActionRow(select)
+
+        if self.seccion == "alumno":
+            filas_botones = [discord.ui.ActionRow(
+                boton("Elegir rama", discord.ButtonStyle.success, "🧭", self._elegir_rama),
+                boton("Mi progreso", discord.ButtonStyle.primary, "📚", self._progreso),
+                boton("Mis lecciones", discord.ButtonStyle.primary, "🗓️", self._lecciones),
+                boton("Mis certificados", discord.ButtonStyle.success, "🎓", self._certificados),
+            )]
+        else:
+            fila_1 = [boton("Cola de evaluaciones", discord.ButtonStyle.secondary, "📋", self._cola)]
+            if self.puede_ascender:
+                fila_1.append(boton("Ascender", discord.ButtonStyle.danger, "⬆️", self._ascender))
+            filas_botones = [
+                discord.ui.ActionRow(*fila_1),
+                discord.ui.ActionRow(
+                    boton("Agendar sesión", discord.ButtonStyle.secondary, "🗓️", self._agendar),
+                    boton("Panel de instructor", discord.ButtonStyle.secondary, "🧑‍🏫", self._panel_instructor),
+                ),
+            ]
+
+        hijos_texto = [
+            discord.ui.TextDisplay("# 🎓 Panel de Academia"),
+            discord.ui.TextDisplay("Elige una sección en el menú y ahí abajo aparecen sus acciones."),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            fila_select,
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            *filas_botones,
+        ]
+
+        color = BRAND_BEACON_AMBER
+        if nombre_banner:
+            self.add_item(discord.ui.Container(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{nombre_banner}")),
+                accent_color=color,
+            ))
+        self.add_item(discord.ui.Container(*hijos_texto, accent_color=color))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        # Por defecto, un error acá quedaba invisible — Discord solo
+        # muestra "La aplicación no respondió" sin rastro del motivo real.
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"Ocurrió un error: {error}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Ocurrió un error: {error}", ephemeral=True)
+        except Exception:
+            pass
+
+    async def _elegir_rama(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             "¿A qué rama querés inscribirte?", view=ElegirRamaView(), ephemeral=True,
         )
 
-    @discord.ui.button(label="Mi progreso", style=discord.ButtonStyle.primary, emoji="📚")
-    async def progreso_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _progreso(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         try:
             embed = await _embed_progreso(interaction.user)
@@ -2566,8 +2767,7 @@ class AcademiaView(discord.ui.View):
             return
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Mis lecciones", style=discord.ButtonStyle.primary, emoji="🗓️")
-    async def lecciones_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _lecciones(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         sesiones = await sessions_core.sessions_for_user(db, str(interaction.user.id))
         if not sesiones:
@@ -2584,8 +2784,7 @@ class AcademiaView(discord.ui.View):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Mis certificados", style=discord.ButtonStyle.success, emoji="🎓")
-    async def certificados_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _certificados(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         try:
             embed, texto = await _embed_certificados(interaction.user)
@@ -2594,8 +2793,7 @@ class AcademiaView(discord.ui.View):
             return
         await interaction.followup.send(embed=embed, content=texto, ephemeral=True)
 
-    @discord.ui.button(label="Cola de evaluaciones", style=discord.ButtonStyle.secondary, emoji="📋")
-    async def cola_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _cola(self, interaction: discord.Interaction):
         if not es_staff_moderacion(interaction.user):
             await interaction.response.send_message("Esta opción es solo para Instructores/Staff.", ephemeral=True)
             return
@@ -2608,8 +2806,7 @@ class AcademiaView(discord.ui.View):
         vista = ColaAcademiaView(evaluaciones, inscripciones, interaction.guild) if (evaluaciones or inscripciones) else None
         await interaction.followup.send(embed=embed, content=texto, view=vista, ephemeral=True)
 
-    @discord.ui.button(label="Ascender", style=discord.ButtonStyle.danger)
-    async def ascender_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _ascender(self, interaction: discord.Interaction):
         # No hace falta re-chequear permiso aquí: si el botón está visible es
         # porque _puede_ascender_alguna ya dio true en __init__, y el permiso
         # exacto por categoría se vuelve a validar en _procesar_ascenso.
@@ -2617,8 +2814,7 @@ class AcademiaView(discord.ui.View):
             "Elige al usuario a ascender:", view=AscenderInicioView(), ephemeral=True,
         )
 
-    @discord.ui.button(label="Agendar sesión", style=discord.ButtonStyle.secondary, emoji="🗓️")
-    async def agendar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _agendar(self, interaction: discord.Interaction):
         # Bloque C4: reemplaza a /academia-agendar como comando aparte —
         # la re-validación de permiso (por si el rol cambió después de
         # abrirse el panel) queda igual que en el resto de los botones
@@ -2628,8 +2824,7 @@ class AcademiaView(discord.ui.View):
             return
         await interaction.response.send_modal(AgendarSesionModal())
 
-    @discord.ui.button(label="Panel de instructor", style=discord.ButtonStyle.secondary, emoji="🧑‍🏫")
-    async def panel_instructor_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _panel_instructor(self, interaction: discord.Interaction):
         if not es_staff_moderacion(interaction.user):
             await interaction.response.send_message("Esta opción es solo para Instructores/Staff.", ephemeral=True)
             return
@@ -2643,9 +2838,13 @@ class AcademiaView(discord.ui.View):
 
 @tree.command(name="academia", description="Abre tu panel de Academia: progreso, certificados, cola de evaluaciones y ascensos")
 async def academia(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "Elige qué quieres ver:", view=AcademiaView(interaction.user), ephemeral=True,
-    )
+    nombre_banner = await _nombre_imagen_formal_siguiente()
+    archivo = _archivo_imagen_formal(nombre_banner)
+    vista = AcademiaView(interaction.user, nombre_banner if archivo else None)
+    if archivo:
+        await interaction.response.send_message(view=vista, file=archivo, ephemeral=True)
+    else:
+        await interaction.response.send_message(view=vista, ephemeral=True)
 
 
 class EcoModal(discord.ui.Modal, title="Mandar mensaje"):
@@ -6497,6 +6696,20 @@ async def on_interaction(interaction: discord.Interaction):
     if custom_id and custom_id.startswith("foto_voto:"):
         _, message_id_opcion = custom_id.split(":", 1)
         await _procesar_voto_foto_semana(interaction, message_id_opcion)
+        return
+
+    if custom_id == ABRIR_COLA_ACADEMIA_CUSTOM_ID:
+        if not es_staff_moderacion(interaction.user):
+            await interaction.response.send_message("Esta opción es solo para Instructores/Staff.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed, texto, evaluaciones, inscripciones = await _embed_cola()
+        except Exception as err:
+            await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
+            return
+        vista = ColaAcademiaView(evaluaciones, inscripciones, interaction.guild) if (evaluaciones or inscripciones) else None
+        await interaction.followup.send(embed=embed, content=texto, view=vista, ephemeral=True)
         return
 
     if custom_id in (ENCUESTA_CONTROL_CUSTOM_SI, ENCUESTA_CONTROL_CUSTOM_NO):
