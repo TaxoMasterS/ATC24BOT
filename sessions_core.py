@@ -59,6 +59,8 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
         ("live_since", "INTEGER"),        # cuándo pasó a 'live' — separado de updated_at porque las inscripciones también lo tocan
         ("last_activity_at", "INTEGER"),  # último join/leave — para el auto-cierre por inactividad
         ("reminder_sent_at", "INTEGER"),  # evita mandar el recordatorio más de una vez
+        ("voice_channel_id", "TEXT"),     # canal de voz dedicado de la clase (grupal o individual)
+        ("private", "INTEGER NOT NULL DEFAULT 0"),  # 1 = sesión individual improvisada — nunca se anuncia en el panel público
     ]:
         try:
             await conn.execute(f"ALTER TABLE academy_sessions ADD COLUMN {columna} {tipo}")
@@ -68,14 +70,15 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
 
 
 async def create_session(conn: aiosqlite.Connection, *, category: str, course_title: str,
-                          instructor_id: str, scheduled_at_ms: int, max_students: int | None = None) -> dict:
+                          instructor_id: str, scheduled_at_ms: int, max_students: int | None = None,
+                          private: bool = False) -> dict:
     row_uuid = str(_uuid.uuid4())
     now = _now_ms()
     await conn.execute(
         """INSERT INTO academy_sessions
-           (uuid, category, course_title, instructor_id, scheduled_at, max_students, state, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)""",
-        (row_uuid, category, course_title, instructor_id, scheduled_at_ms, max_students, now, now),
+           (uuid, category, course_title, instructor_id, scheduled_at, max_students, state, private, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?)""",
+        (row_uuid, category, course_title, instructor_id, scheduled_at_ms, max_students, int(private), now, now),
     )
     await conn.commit()
     return await get_session(conn, row_uuid)
@@ -88,8 +91,10 @@ async def get_session(conn: aiosqlite.Connection, session_uuid: str) -> dict | N
 
 
 async def upcoming_sessions(conn: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
+    """Solo sesiones PÚBLICAS (grupales) — las individuales improvisadas
+    (private=1) nunca deben aparecer en el panel general de Academia."""
     cur = await conn.execute(
-        "SELECT * FROM academy_sessions WHERE state = 'scheduled' ORDER BY scheduled_at ASC LIMIT ?",
+        "SELECT * FROM academy_sessions WHERE state = 'scheduled' AND private = 0 ORDER BY scheduled_at ASC LIMIT ?",
         (limit,),
     )
     return [dict(r) for r in await cur.fetchall()]
@@ -126,8 +131,28 @@ async def set_live(conn: aiosqlite.Connection, session_uuid: str, channel_id: st
 
 
 async def live_sessions(conn: aiosqlite.Connection) -> list[dict]:
-    cur = await conn.execute("SELECT * FROM academy_sessions WHERE state = 'live' ORDER BY live_since ASC")
+    """Solo sesiones PÚBLICAS en vivo — ver nota de upcoming_sessions."""
+    cur = await conn.execute(
+        "SELECT * FROM academy_sessions WHERE state = 'live' AND private = 0 ORDER BY live_since ASC"
+    )
     return [dict(r) for r in await cur.fetchall()]
+
+
+async def set_voice_channel(conn: aiosqlite.Connection, session_uuid: str, voice_channel_id: str | None) -> None:
+    await conn.execute(
+        "UPDATE academy_sessions SET voice_channel_id = ?, updated_at = ? WHERE uuid = ?",
+        (voice_channel_id, _now_ms(), session_uuid),
+    )
+    await conn.commit()
+
+
+async def session_by_voice_channel(conn: aiosqlite.Connection, voice_channel_id: str) -> dict | None:
+    cur = await conn.execute(
+        "SELECT * FROM academy_sessions WHERE voice_channel_id = ? AND state IN ('scheduled', 'live')",
+        (str(voice_channel_id),),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def marcar_actividad(conn: aiosqlite.Connection, session_uuid: str) -> None:

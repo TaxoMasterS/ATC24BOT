@@ -213,6 +213,12 @@ db: "aiosqlite.Connection" = None  # se asigna en setup_hook
 # en el canal de voz de la posición, no se está controlando de verdad.
 ATC_VACIO_GRACIA_SEG = 10 * 60  # 10 minutos
 
+# Canales de voz de clases de Academia (grupales e individuales): margen
+# corto antes de borrarlos si quedan vacíos — a diferencia de una posición
+# ATC, una clase vacía no tiene motivo para seguir ocupando un canal.
+ACADEMIA_VOZ_VACIO_GRACIA_SEG = 90  # 1.5 minutos
+_academia_voz_close_timers: dict = {}  # session_uuid -> asyncio.Task
+
 
 def _leer_json(nombre: str, default: dict) -> dict:
     ruta = os.path.join(CARPETA_DATOS, nombre)
@@ -936,7 +942,11 @@ def _viernes_00_utc_anterior(desde: "datetime.datetime") -> "datetime.datetime":
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == client.user.id:
         return
-    if str(payload.channel_id) != str(DISCORD_CHANNEL_FOTO_SEMANA):
+    # A pedido explícito: la ⭐ nomina desde CUALQUIER canal del servidor (el
+    # canal de foto-de-la-semana quedó de solo-lectura, ya nadie escribe
+    # ahí) — solo se exige que sea del mismo servidor, para no procesar
+    # reacciones de DMs u otros servidores.
+    if GUILD_ID and str(payload.guild_id) != str(GUILD_ID):
         return
     if str(payload.emoji) != "⭐":
         return
@@ -989,13 +999,13 @@ def _construir_payload_nominadas_foto_semana(nominadas: list) -> tuple[dict, str
     mensaje original de cada nominada — nunca la imagen nominada en sí
     (metida dentro de un Media Gallery salía recortada)."""
     if not nominadas:
-        cuerpo = "_Todavía no hay ninguna foto nominada esta semana. Reacciona con ⭐ a una foto para nominarla._"
+        cuerpo = "_Todavía no hay ninguna foto nominada esta semana. Reacciona con ⭐ a una foto, en **cualquier canal del servidor**, para nominarla._"
     else:
         lineas = [
-            f"**{i}.** <@{n['author_id']}> — [Ver foto]({n['jump_url']})"
+            f"**{i}.** <@{n['author_id']}>\n[Ver foto]({n['jump_url']})"
             for i, n in enumerate(nominadas, start=1)
         ]
-        cuerpo = "\n".join(lineas)
+        cuerpo = "\n\n".join(lineas)
         if len(nominadas) < 3:
             faltan = 3 - len(nominadas)
             cuerpo += f"\n\n_Hacen falta {_plural(faltan, 'nominada más', 'nominadas más')} para abrir la votación el viernes._"
@@ -1010,9 +1020,11 @@ def _construir_payload_nominadas_foto_semana(nominadas: list) -> tuple[dict, str
     contenedores.append({
         "type": 17, "accent_color": BRAND_BEACON_AMBER,
         "components": [
-            {"type": 10, "content": "# ⭐ Nominadas de la semana"},
+            {"type": 10, "content": "# ⭐ Foto de la semana — Nominadas"},
             {"type": 14, "divider": True, "spacing": 1},
             {"type": 10, "content": cuerpo},
+            {"type": 14, "divider": True, "spacing": 1},
+            {"type": 10, "content": "-# Para nominar tu foto (o la de alguien más), reacciona con ⭐ a ese mensaje en cualquier canal del servidor. La votación abre todos los viernes 00:00 UTC si hay 3 o más nominadas."},
         ],
     })
 
@@ -1301,12 +1313,13 @@ async def _reconciliar_paneles_permanentes_al_arrancar():
     if _sesiones_message_id:
         print(f"Sesiones agendadas: retomo el panel existente ({_sesiones_message_id}) tras el reinicio.")
 
-    # Con el message_id ya reconciliado (o limpiado si no existía más), se
-    # fuerza un refresco real de contenido — así los paneles quedan al día
-    # apenas el bot vuelve a estar arriba, en vez de esperar al próximo
-    # trigger natural (un mensaje nuevo en el canal, una inscripción, etc.).
-    for nombre in await _refrescar_dashboards_en_vivo():
-        print(f"Dashboard refrescado al arrancar: {nombre}")
+    # A pedido explícito: NO se fuerza un repost/edit de los paneles acá —
+    # eso mandaba mensajes (o los editaba de forma visible) cada vez que el
+    # bot se reiniciaba, aunque nada hubiera cambiado. Si el panel ya existe
+    # (message_id reconciliado arriba), se queda tal cual hasta que un
+    # evento real lo actualice (nueva nominación, nueva sesión, cambio en la
+    # tabla ATC, etc.) o se use "!dashboards" a mano. Si NO existe más, no
+    # se recrea solo — se crea recién cuando ese evento real lo necesite.
 
 
 async def _refrescar_dashboards_en_vivo() -> list[str]:
@@ -1915,11 +1928,23 @@ class InscripcionAccionView(discord.ui.View):
         await interaction.response.send_message(f"Inscripción rechazada para <@{fila['user_id']}>.", ephemeral=True)
 
 
+def _nombre_visible(guild: "discord.Guild | None", user_id) -> str:
+    """Nombre para mostrar en textos que Discord NO resuelve automáticamente
+    (los labels/descriptions de SelectOption no soportan menciones <@id>,
+    salen como texto crudo) — usa el apodo/nombre del servidor si el
+    miembro está en caché, si no cae de vuelta al ID."""
+    if guild is not None:
+        miembro = guild.get_member(int(user_id))
+        if miembro is not None:
+            return miembro.display_name
+    return f"Usuario {user_id}"
+
+
 class InscripcionesSelect(discord.ui.Select):
-    def __init__(self, items: list):
+    def __init__(self, items: list, guild: "discord.Guild | None" = None):
         opciones = [
             discord.SelectOption(
-                label=f"{BRANCH_LABEL.get(it['branch'], it['branch'])} — {it['user_id']}"[:100],
+                label=f"{BRANCH_LABEL.get(it['branch'], it['branch'])} — {_nombre_visible(guild, it['user_id'])}"[:100],
                 value=it["uuid"],
             )
             for it in items[:25]
@@ -2096,10 +2121,10 @@ class EvaluacionAccionView(discord.ui.View):
 
 
 class EvaluacionesSelect(discord.ui.Select):
-    def __init__(self, items: list):
+    def __init__(self, items: list, guild: "discord.Guild | None" = None):
         opciones = [
             discord.SelectOption(
-                label=it["courseTitle"][:100], description=f"Alumno {it['userId']}"[:100],
+                label=it["courseTitle"][:100], description=f"Alumno: {_nombre_visible(guild, it['userId'])}"[:100],
                 value=f"{it['userId']}|{it['courseUuid']}",
             )
             for it in items[:25]
@@ -2118,12 +2143,12 @@ class EvaluacionesSelect(discord.ui.Select):
 
 
 class ColaAcademiaView(discord.ui.View):
-    def __init__(self, evaluaciones: list, inscripciones: list):
+    def __init__(self, evaluaciones: list, inscripciones: list, guild: "discord.Guild | None" = None):
         super().__init__(timeout=180)
         if inscripciones:
-            self.add_item(InscripcionesSelect(inscripciones))
+            self.add_item(InscripcionesSelect(inscripciones, guild))
         if evaluaciones:
-            self.add_item(EvaluacionesSelect(evaluaciones))
+            self.add_item(EvaluacionesSelect(evaluaciones, guild))
 
 
 class AscenderRangoSelect(discord.ui.Select):
@@ -2205,6 +2230,91 @@ class AgendarSesionModal(discord.ui.Modal, title="Agendar sesión de Academia"):
         await interaction.followup.send(f"Sesión **{self.curso}** agendada para <t:{ts}:R>. ✅", ephemeral=True)
 
 
+async def _categoria_academia_sesiones(guild: discord.Guild) -> "discord.CategoryChannel | None":
+    """Categoría compartida por todas las clases de Academia (grupales e
+    individuales) — se crea una sola vez, justo debajo de ACADEMIA."""
+    categoria = discord.utils.get(guild.categories, name="Academia — Sesiones")
+    if categoria is not None:
+        return categoria
+    try:
+        categoria = await guild.create_category("Academia — Sesiones")
+        cat_academia = guild.get_channel(1238796826317164631)
+        if cat_academia:
+            try:
+                await categoria.edit(position=cat_academia.position + 1)
+            except discord.HTTPException as err:
+                print(f"Aviso: no pude reposicionar la categoría 'Academia — Sesiones': {err}")
+        return categoria
+    except discord.Forbidden:
+        return None
+
+
+async def _crear_canal_voz_clase_grupal(sesion: dict) -> "discord.VoiceChannel | None":
+    """Canal de voz de una clase grupal agendada — se crea recién cuando la
+    clase arranca de verdad (no al agendarla), con cupo igual al máximo de
+    alumnos de la sesión."""
+    guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
+    if not guild:
+        return None
+    categoria = await _categoria_academia_sesiones(guild)
+    if categoria is None:
+        return None
+    nombre = f"{sesion['category']}-{sesion['course_title']}"[:100]
+    try:
+        return await guild.create_voice_channel(
+            nombre, category=categoria, user_limit=(sesion.get("max_students") or 0),
+            reason="Canal de voz de clase de Academia",
+        )
+    except discord.Forbidden:
+        return None
+
+
+def _cancelar_timer_cierre_voz_sesion(session_uuid: str) -> None:
+    tarea = _academia_voz_close_timers.pop(session_uuid, None)
+    if tarea and not tarea.done():
+        tarea.cancel()
+
+
+async def _borrar_canal_voz_sesion(sesion: dict) -> None:
+    """Borra el canal de voz de la clase (grupal o individual) al cerrarla
+    o cancelarla — nunca debe quedar un canal huérfano."""
+    _cancelar_timer_cierre_voz_sesion(sesion["uuid"])
+    voice_id = sesion.get("voice_channel_id")
+    if not voice_id:
+        return
+    guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
+    canal = guild.get_channel(int(voice_id)) if guild else None
+    if canal:
+        try:
+            await canal.delete(reason="Sesión de Academia cerrada/cancelada")
+        except discord.HTTPException as err:
+            print(f"Aviso: no pude borrar el canal de voz de la sesión {sesion['uuid']}: {err}")
+    await sessions_core.set_voice_channel(db, sesion["uuid"], None)
+
+
+async def _mandar_dashboard_instructor(sesion: dict) -> None:
+    """Cada clase que arranca (grupal o individual) manda un dashboard de
+    control por MD al instructor — antes había que ir a buscarlo a mano
+    desde /academia, y para las sesiones individuales no existía ninguno."""
+    try:
+        instructor = await client.fetch_user(int(sesion["instructor_id"]))
+    except (discord.Forbidden, discord.NotFound):
+        return
+    inscritos = await sessions_core.count_signups(db, sesion["uuid"])
+    lineas = [f"Tu clase **{sesion['course_title']}** ({sesion['category']}) está en marcha."]
+    if sesion.get("max_students"):
+        lineas.append(f"Cupo: {inscritos}/{sesion['max_students']}.")
+    if sesion.get("voice_channel_id"):
+        lineas.append(f"Canal de voz: <#{sesion['voice_channel_id']}>.")
+    embed = discord.Embed(title="🎓 Dashboard de tu clase", description="\n".join(lineas), color=BRAND_RADAR_GREEN)
+    try:
+        await instructor.send(embed=embed, view=PanelInstructorAccionView(sesion))
+    except (discord.Forbidden, discord.NotFound):
+        pass
+    except Exception as err:
+        print(f"Aviso: no pude mandar el dashboard de instructor de la sesión {sesion.get('uuid')}: {err}")
+
+
 async def _cerrar_mensaje_sesion_en_vivo(sesion: dict) -> None:
     if not sesion.get("channel_id") or not sesion.get("message_id"):
         return
@@ -2268,6 +2378,10 @@ class PanelInstructorAccionView(discord.ui.View):
             self.remove_item(self.atrasar_btn)
             self.remove_item(self.adelantar_btn)
             self.remove_item(self.iniciar_btn)
+        if sesion.get("private"):
+            # Individual/improvisada — "Anunciar" publica en el canal
+            # general de Academia, y esta clase nunca debe aparecer ahí.
+            self.remove_item(self.anunciar_btn)
 
     @discord.ui.button(label="Atrasar 15 min", style=discord.ButtonStyle.secondary, emoji="⏪")
     async def atrasar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2315,6 +2429,7 @@ class PanelInstructorAccionView(discord.ui.View):
         # está en vivo), así que hay que borrarlo siempre, sin importar en
         # qué estado estaba al cancelarla.
         await _cerrar_mensaje_sesion_en_vivo(self.sesion)
+        await _borrar_canal_voz_sesion(self.sesion)
         await _repostear_sesiones_agendadas()
         await interaction.followup.send("Sesión cancelada.", ephemeral=True)
 
@@ -2323,68 +2438,46 @@ class PanelInstructorAccionView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         await sessions_core.set_state(db, self.sesion["uuid"], sessions_core.COMPLETED)
         await _cerrar_mensaje_sesion_en_vivo(self.sesion)
-        await interaction.followup.send("Sesión marcada como completada.", ephemeral=True)
+        await _borrar_canal_voz_sesion(self.sesion)
+        n = await _desbloquear_evaluacion_para_sesion(self.sesion)
+        extra = f" {_plural(n, 'alumno desbloqueado', 'alumnos desbloqueados')} para evaluación." if n else ""
+        await interaction.followup.send(f"Sesión marcada como completada.{extra}", ephemeral=True)
 
     @discord.ui.button(label="Anunciar", style=discord.ButtonStyle.primary, emoji="📢", row=1)
     async def anunciar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AnuncioSesionModal(self.sesion))
 
-    @discord.ui.button(label="Aprobar alumnos", style=discord.ButtonStyle.success, emoji="🎓", row=2)
-    async def aprobar_alumnos_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Eslabón que faltaba en el flujo de Academia: esto es lo único que
-        # mueve a un alumno de "asistió a la clase" a "disponible para
-        # evaluación" — sin esto, la Cola de Academia nunca tenía nada.
-        alumnos = await sessions_core.list_signups(db, self.sesion["uuid"])
-        if not alumnos:
-            await interaction.response.send_message("Todavía no hay alumnos anotados en esta sesión.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "Elige a quién aprobar para pasar a evaluación:", view=AprobarAlumnosView(self.sesion, alumnos), ephemeral=True,
-        )
 
-
-class AprobarAlumnoSelect(discord.ui.Select):
-    def __init__(self, sesion: dict, alumnos: list[str]):
-        self.sesion = sesion
-        opciones = [discord.SelectOption(label=f"Alumno {uid}", value=uid) for uid in alumnos[:25]]
-        super().__init__(placeholder="Elige el alumno a aprobar…", options=opciones)
-
-    async def callback(self, interaction: discord.Interaction):
-        user_id = self.values[0]
-        rama = _RATING_A_RAMA.get(self.sesion["category"])
-        if not rama:
-            await interaction.response.send_message(
-                f"No reconozco \"{self.sesion['category']}\" como un rating de ninguna rama — no puedo determinar "
-                "qué curso aprobar.", ephemeral=True,
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
-        resultado = await academy_core.mark_ready_for_evaluation(db, user_id, rama)
+async def _desbloquear_evaluacion_para_sesion(sesion: dict) -> int:
+    """Con solo asistir a la clase (estar anotado cuando el instructor la
+    cierra) ya queda desbloqueada la evaluación — no hace falta que el
+    instructor apruebe alumno por alumno a mano. Devuelve cuántos quedaron
+    desbloqueados."""
+    alumnos = await sessions_core.list_signups(db, sesion["uuid"])
+    if not alumnos:
+        return 0
+    rama = _RATING_A_RAMA.get(sesion["category"])
+    if not rama:
+        return 0
+    n = 0
+    for user_id in alumnos:
+        try:
+            resultado = await academy_core.mark_ready_for_evaluation(db, user_id, rama)
+        except Exception as err:
+            print(f"Aviso: no pude desbloquear evaluación para {user_id} en {sesion['uuid']}: {err}")
+            continue
         if not resultado:
-            await interaction.followup.send(
-                f"<@{user_id}> no tiene ningún curso en progreso en la rama {BRANCH_LABEL.get(rama, rama)} ahora mismo.",
-                ephemeral=True,
-            )
-            return
-        await interaction.followup.send(
-            f"<@{user_id}> queda disponible para evaluación de **{resultado['courseTitle']}** — ya aparece en la "
-            "Cola de Academia. ✅",
-            ephemeral=True,
-        )
+            continue
+        n += 1
         try:
             alumno = await client.fetch_user(int(user_id))
             await alumno.send(
-                f"Tu instructor te aprobó para pasar a la evaluación de **{resultado['courseTitle']}**. "
+                f"Terminaste **{resultado['courseTitle']}** — ya quedaste disponible para evaluación. "
                 "Un instructor te va a evaluar pronto."
             )
         except (discord.Forbidden, discord.NotFound):
             pass
-
-
-class AprobarAlumnosView(discord.ui.View):
-    def __init__(self, sesion: dict, alumnos: list[str]):
-        super().__init__(timeout=180)
-        self.add_item(AprobarAlumnoSelect(sesion, alumnos))
+    return n
 
 
 class SesionInstructorSelect(discord.ui.Select):
@@ -2512,7 +2605,7 @@ class AcademiaView(discord.ui.View):
         except Exception as err:
             await interaction.followup.send(f"No pude consultar la cola: {err}", ephemeral=True)
             return
-        vista = ColaAcademiaView(evaluaciones, inscripciones) if (evaluaciones or inscripciones) else None
+        vista = ColaAcademiaView(evaluaciones, inscripciones, interaction.guild) if (evaluaciones or inscripciones) else None
         await interaction.followup.send(embed=embed, content=texto, view=vista, ephemeral=True)
 
     @discord.ui.button(label="Ascender", style=discord.ButtonStyle.danger)
@@ -2972,26 +3065,57 @@ async def _cerrar_atc_por_inactividad(op_uuid: str, voice_channel_id: str) -> No
     _atc_close_timers.pop(op_uuid, None)
 
 
+async def _borrar_canal_voz_sesion_por_inactividad(session_uuid: str, voice_channel_id: str) -> None:
+    """Igual que _cerrar_atc_por_inactividad, pero solo borra el canal de
+    voz de la clase — no toca el estado de la sesión (eso lo maneja el
+    instructor a mano, o el auto-cierre de 180 min por inactividad real de
+    sessions_core)."""
+    try:
+        await asyncio.sleep(ACADEMIA_VOZ_VACIO_GRACIA_SEG)
+    except asyncio.CancelledError:
+        return
+    guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
+    canal = guild.get_channel(int(voice_channel_id)) if guild else None
+    if canal and any(not m.bot for m in canal.members):
+        return  # alguien volvió a entrar mientras esperábamos
+    sesion = await sessions_core.get_session(db, session_uuid)
+    if sesion and sesion.get("voice_channel_id") == str(voice_channel_id):
+        await _borrar_canal_voz_sesion(sesion)
+    _academia_voz_close_timers.pop(session_uuid, None)
+
+
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if before.channel == after.channel:
         return
     for canal in filter(None, {before.channel, after.channel}):
         fila = await atc_core.get_atc_by_voice_channel(db, str(canal.id))
-        if not fila:
+        if fila:
+            vacio = not any(not m.bot for m in canal.members)
+            if vacio:
+                if fila["uuid"] not in _atc_close_timers:
+                    _atc_close_timers[fila["uuid"]] = client.loop.create_task(
+                        _cerrar_atc_por_inactividad(fila["uuid"], str(canal.id))
+                    )
+            else:
+                _cancelar_timer_cierre_atc(fila["uuid"])
+                # Reafirma el estado "ATC: {controlador}" — cualquiera con
+                # permiso de chat en el canal de voz puede cambiarlo desde el
+                # cliente, así que se re-aplica cada vez que hay actividad.
+                await _fijar_estado_canal_voz(str(canal.id), f"ATC: {fila['controller_name'] or fila['owner_id']}")
+            continue
+
+        sesion = await sessions_core.session_by_voice_channel(db, str(canal.id))
+        if not sesion:
             continue
         vacio = not any(not m.bot for m in canal.members)
         if vacio:
-            if fila["uuid"] not in _atc_close_timers:
-                _atc_close_timers[fila["uuid"]] = client.loop.create_task(
-                    _cerrar_atc_por_inactividad(fila["uuid"], str(canal.id))
+            if sesion["uuid"] not in _academia_voz_close_timers:
+                _academia_voz_close_timers[sesion["uuid"]] = client.loop.create_task(
+                    _borrar_canal_voz_sesion_por_inactividad(sesion["uuid"], str(canal.id))
                 )
         else:
-            _cancelar_timer_cierre_atc(fila["uuid"])
-            # Reafirma el estado "ATC: {controlador}" — cualquiera con
-            # permiso de chat en el canal de voz puede cambiarlo desde el
-            # cliente, así que se re-aplica cada vez que hay actividad.
-            await _fijar_estado_canal_voz(str(canal.id), f"ATC: {fila['controller_name'] or fila['owner_id']}")
+            _cancelar_timer_cierre_voz_sesion(sesion["uuid"])
 
 
 # ─── Dashboard privado de ATC por MD (Bloque A7) ──────────────────────────
@@ -4642,8 +4766,32 @@ async def _repostear_tabla_atc(activos: list):
 # de los paneles Components V2 de este bot.
 SOLICITAR_SESION_CUSTOM_ID = "atc24:solicitar_sesion"
 _sesiones_message_id = None
+_sesiones_separador_message_id = None
 _sesiones_lock = asyncio.Lock()
 _ultima_solicitud_sesion = {}  # discord_id -> timestamp de asyncio loop
+# Mismo motivo que _tabla_atc_pendientes_borrar: si el borrado del mensaje
+# viejo falla (rate limit u otro error de Discord), sin esta lista se pierde
+# el rastro y el mensaje viejo queda visible para siempre junto al nuevo —
+# exactamente el bug que se vio en vivo (panel duplicado).
+_sesiones_pendientes_borrar: list = []
+
+
+def _construir_payload_separador_sesiones() -> dict:
+    """Mensaje chico que siempre queda justo arriba del panel — separa
+    visualmente los mensajes de las clases (arriba) del panel resumen
+    (abajo), a pedido explícito."""
+    return {
+        "flags": 32768,
+        "allowed_mentions": {"parse": []},
+        "components": [
+            {
+                "type": 17, "accent_color": BRAND_BEACON_AMBER,
+                "components": [
+                    {"type": 10, "content": "-# ⬇️ Panel de Academia — se actualiza solo, siempre queda acá abajo"},
+                ],
+            },
+        ],
+    }
 
 
 def _agrupar_sesiones_por_categoria(sesiones: list, *, en_vivo: bool) -> list:
@@ -4724,11 +4872,12 @@ def _construir_payload_sesiones_agendadas(sesiones: list, en_vivo: list | None =
 
 
 async def _repostear_sesiones_agendadas():
-    """Borra el panel viejo (si existe) y publica uno nuevo — igual que la
-    tabla de ATC, para que quede siempre como el último mensaje del canal.
-    Lo dispara on_message en el canal de Academia (con cooldown), además de
+    """Borra el separador + el panel viejos (si existen) y publica los dos
+    de nuevo — igual que la tabla de ATC, para que el panel quede siempre
+    como el último mensaje del canal, con el separador justo arriba. Lo
+    dispara on_message en el canal de Academia (con cooldown), además de
     cada vez que cambia el estado de una sesión."""
-    global _sesiones_message_id
+    global _sesiones_message_id, _sesiones_separador_message_id, _sesiones_pendientes_borrar
     if not DISCORD_CHANNEL_ACADEMIA_SESIONES:
         return
     async with _sesiones_lock:
@@ -4737,20 +4886,47 @@ async def _repostear_sesiones_agendadas():
         for s in sesiones + en_vivo:
             s["_inscritos"] = await sessions_core.count_signups(db, s["uuid"])
         payload, nombre_banner = _construir_payload_sesiones_agendadas(sesiones, en_vivo)
+        payload_separador = _construir_payload_separador_sesiones()
         headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
 
+        # Se borran los dos mensajes viejos (separador + panel). Si un
+        # borrado falla, se guarda para reintentar en el PRÓXIMO repost en
+        # vez de perder el rastro — ese "perder el rastro" es justo lo que
+        # dejaba el panel duplicado visible.
+        a_borrar = list(_sesiones_pendientes_borrar)
+        if _sesiones_separador_message_id:
+            a_borrar.append(_sesiones_separador_message_id)
         if _sesiones_message_id:
+            a_borrar.append(_sesiones_message_id)
+        _sesiones_pendientes_borrar = []
+        _sesiones_separador_message_id = None
+        _sesiones_message_id = None
+        await bot_state.set(db, "sesiones_agendadas_message_id", None)
+        await bot_state.set(db, "sesiones_agendadas_separador_message_id", None)
+
+        for msg_id in a_borrar:
             try:
                 status_del, data_del, texto_del = await _discord_request(
-                    "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages/{_sesiones_message_id}",
+                    "DELETE", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages/{msg_id}",
                     headers=headers,
                 )
                 if status_del not in (204, 404):
-                    print(f"Aviso: no pude borrar el panel de sesiones agendadas viejo: {status_del} {texto_del or data_del}")
+                    print(f"Aviso: no pude borrar un mensaje viejo del panel de sesiones ({msg_id}): {status_del} {texto_del or data_del}")
+                    _sesiones_pendientes_borrar.append(msg_id)
             except Exception as err:
-                print(f"Aviso: no pude borrar el panel de sesiones agendadas viejo: {err}")
-            _sesiones_message_id = None
-            await bot_state.set(db, "sesiones_agendadas_message_id", None)
+                print(f"Aviso: no pude borrar un mensaje viejo del panel de sesiones ({msg_id}): {err}")
+                _sesiones_pendientes_borrar.append(msg_id)
+
+        # Separador primero, panel después — así el panel queda último.
+        status_sep, data_sep, texto_sep = await _discord_request(
+            "POST", f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ACADEMIA_SESIONES}/messages",
+            headers=headers, json_body=payload_separador,
+        )
+        if status_sep >= 300:
+            print(f"Aviso: no pude publicar el separador del panel de sesiones: {status_sep} {texto_sep or data_sep}")
+        else:
+            _sesiones_separador_message_id = data_sep["id"]
+            await bot_state.set(db, "sesiones_agendadas_separador_message_id", _sesiones_separador_message_id)
 
         if nombre_banner:
             ruta = os.path.join(CARPETA_SCRIPT, "assets", nombre_banner)
@@ -4815,24 +4991,11 @@ class ConfirmarDisponibilidadView(discord.ui.View):
         guild = client.get_guild(int(GUILD_ID)) if GUILD_ID else None
         canal_voz = None
         if guild:
-            categoria = discord.utils.get(guild.categories, name="Academia — Sesiones")
-            if categoria is None:
-                try:
-                    categoria = await guild.create_category("Academia — Sesiones")
-                    # Se ubica justo debajo de la categoría ACADEMIA (arriba
-                    # de TERMINAL) en vez de quedar al final del todo, que es
-                    # donde Discord la pondría por defecto.
-                    cat_academia = guild.get_channel(1238796826317164631)
-                    if cat_academia:
-                        try:
-                            await categoria.edit(position=cat_academia.position + 1)
-                        except discord.HTTPException as err:
-                            print(f"Aviso: no pude reposicionar la categoría 'Academia — Sesiones': {err}")
-                except discord.Forbidden:
-                    categoria = None
+            categoria = await _categoria_academia_sesiones(guild)
             # Privado por alumno/instructor (pedido explícito de la
             # reestructuración de permisos): antes quedaba abierto a
-            # cualquiera que viera la categoría.
+            # cualquiera que viera la categoría. Cupo de 2 — es una clase
+            # 1 a 1, nadie más entra.
             overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
             alumno_member = guild.get_member(self.alumno_id)
             if alumno_member:
@@ -4844,23 +5007,29 @@ class ConfirmarDisponibilidadView(discord.ui.View):
                 rol = guild.get_role(rid)
                 if rol:
                     overwrites[rol] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-            try:
-                canal_voz = await guild.create_voice_channel(
-                    f"{self.rating}-{interaction.user.display_name}"[:100], category=categoria,
-                    overwrites=overwrites, reason="Salón de sesión individual de Academia",
-                )
-            except discord.Forbidden:
-                canal_voz = None
+            if categoria is not None:
+                try:
+                    canal_voz = await guild.create_voice_channel(
+                        f"{self.rating}-{interaction.user.display_name}"[:100], category=categoria,
+                        overwrites=overwrites, user_limit=2, reason="Salón de sesión individual de Academia",
+                    )
+                except discord.Forbidden:
+                    canal_voz = None
         ahora_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
         sesion = await sessions_core.create_session(
             db, category=self.rating, course_title=f"Sesión {self.rating}",
-            instructor_id=str(self.instructor_id), scheduled_at_ms=ahora_ms, max_students=1,
+            instructor_id=str(self.instructor_id), scheduled_at_ms=ahora_ms, max_students=1, private=True,
         )
         await sessions_core.sign_up(db, sesion["uuid"], str(self.alumno_id))
+        if canal_voz:
+            await sessions_core.set_voice_channel(db, sesion["uuid"], str(canal_voz.id))
+            sesion = await sessions_core.get_session(db, sesion["uuid"])
         try:
+            # Individual: NUNCA se anuncia en el panel público de Academia —
+            # solo el dashboard de control por MD al instructor.
             await _publicar_sesion_en_vivo(sesion)
         except Exception as err:
-            print(f"ERROR al publicar la sesión individual en vivo: {err}")
+            print(f"ERROR al iniciar la sesión individual: {err}")
         salon_txt = f" Salón de voz: {canal_voz.mention}" if canal_voz else ""
         await interaction.followup.send(f"¡Listo! Tu sesión de {self.rating} está en marcha.{salon_txt}", ephemeral=True)
 
@@ -4979,6 +5148,8 @@ def _construir_payload_sesion_en_vivo(sesion: dict, inscritos: int):
         f"`{barra}` **{cupo}** alumno(s) anotados. Usa **Unirse** para anotarte desde ahora, o **Ver alumnos** "
         "para ver quién ya está anotado.",
     ]
+    if en_vivo and sesion.get("voice_channel_id"):
+        lineas.append(f"🔊 Canal de voz: <#{sesion['voice_channel_id']}>")
     componentes_container = []
     # El nombre se elige con el uuid de la sesión como semilla — así una
     # edición posterior (join/salir, o pasar de agendada a en vivo)
@@ -5057,9 +5228,28 @@ async def _publicar_panel_sesion(sesion: dict, *, forzar_live: bool = False) -> 
     return await sessions_core.get_session(db, sesion["uuid"])
 
 
-async def _publicar_sesion_en_vivo(sesion: dict):
-    """Alias histórico — pasa la sesión a 'live' y publica/edita su panel."""
-    await _publicar_panel_sesion(sesion, forzar_live=True)
+async def _publicar_sesion_en_vivo(sesion: dict) -> dict:
+    """Pasa la sesión a 'live'. Grupales: publica/edita el panel público,
+    crea su canal de voz si todavía no tiene uno, y manda al instructor su
+    dashboard de control por MD. Individuales (private=1): NUNCA se
+    anuncian en el panel público — solo el MD al instructor (el canal de
+    voz de esas ya se crea antes, en ConfirmarDisponibilidadView, con
+    overwrites 1-a-1 que acá no se pueden recrear)."""
+    if sesion.get("private"):
+        if sesion["state"] != sessions_core.LIVE:
+            await sessions_core.set_live(db, sesion["uuid"], "", "")
+            sesion = await sessions_core.get_session(db, sesion["uuid"])
+        await _mandar_dashboard_instructor(sesion)
+        return sesion
+
+    sesion = await _publicar_panel_sesion(sesion, forzar_live=True)
+    if not sesion.get("voice_channel_id"):
+        canal_voz = await _crear_canal_voz_clase_grupal(sesion)
+        if canal_voz:
+            await sessions_core.set_voice_channel(db, sesion["uuid"], str(canal_voz.id))
+            sesion = await sessions_core.get_session(db, sesion["uuid"])
+    await _mandar_dashboard_instructor(sesion)
+    return sesion
 
 
 async def _actualizar_mensaje_sesion_en_vivo(sesion: dict):
@@ -5125,6 +5315,8 @@ async def _sesiones_academia_loop():
             for s in await sessions_core.sesiones_para_autocerrar(db):
                 await sessions_core.set_state(db, s["uuid"], sessions_core.COMPLETED)
                 await _cerrar_mensaje_sesion_en_vivo(s)
+                await _borrar_canal_voz_sesion(s)
+                await _desbloquear_evaluacion_para_sesion(s)
                 try:
                     instructor = await client.fetch_user(int(s["instructor_id"]))
                     await instructor.send(
@@ -5815,10 +6007,10 @@ AYUDA_SECCIONES = {
             (
                 "Instructores y Staff",
                 "Desde `/academia` se accede además al panel de instructor (atrasar, adelantar, iniciar, cancelar, "
-                "cerrar, anunciar o **aprobar alumnos** de tus propias sesiones — este último botón es lo que hace "
-                "que un alumno pase a la cola de evaluaciones) y a la cola de evaluaciones, con una rúbrica de 10 "
-                "criterios por rango. Al aprobar, se entrega un certificado con código de verificación por "
-                "mensaje directo.",
+                "cerrar o anunciar tus propias sesiones). Al usar **Cerrar (completar)**, todos los alumnos que "
+                "estaban anotados quedan desbloqueados para evaluación automáticamente — no hace falta aprobarlos "
+                "uno por uno. Después aparecen solos en la cola de evaluaciones, con una rúbrica de 10 criterios "
+                "por rango. Al aprobar, se entrega un certificado con código de verificación por mensaje directo.",
             ),
         ],
     },
@@ -6262,10 +6454,16 @@ async def on_message(message: discord.Message):
         return
 
     with open(archivo, encoding="utf-8") as f:
-        payload = json.load(f)
+        contenido = json.load(f)
 
+    # Un archivo puede ser un solo payload (dict) o una lista de payloads —
+    # esto último para guías largas que superan el límite de Discord de 4000
+    # caracteres de texto visible por mensaje (guia_academia.json, por
+    # ejemplo), publicadas como varios mensajes seguidos en el mismo canal.
+    payloads = contenido if isinstance(contenido, list) else [contenido]
     try:
-        await _publicar_payload_crudo(message.channel.id, payload)
+        for payload in payloads:
+            await _publicar_payload_crudo(message.channel.id, payload)
     except Exception as err:
         await message.reply(f"No pude publicar el mensaje: {err}", delete_after=15)
         print(f"ERROR al publicar mensaje ({comando}): {err}")
