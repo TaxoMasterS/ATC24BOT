@@ -394,6 +394,19 @@ async def atc_pendientes_de_cierre_programado(conn: aiosqlite.Connection) -> lis
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def atc_avisos_cierre_huerfanos(conn: aiosqlite.Connection) -> list[dict]:
+    """Red de seguridad: posiciones YA cerradas (por cualquier vía) a las
+    que se les olvidó borrar el aviso de "cierra en X minutos" — no debería
+    pasar si el cierre limpia bien detrás suyo, pero si algo se escapa
+    (reinicio a mitad de camino, excepción puntual) esto lo detecta en la
+    próxima pasada del mantenimiento en vez de dejarlo pegado para siempre."""
+    cur = await conn.execute(
+        "SELECT * FROM atc_positions WHERE state = ? AND close_announcement_message_id IS NOT NULL",
+        (ATC_FINALIZADA,),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
 async def set_atc_dm(conn: aiosqlite.Connection, row_uuid: str, channel_id: str, message_id: str) -> None:
     await conn.execute(
         "UPDATE atc_positions SET dm_channel_id = ?, dm_message_id = ? WHERE uuid = ?",

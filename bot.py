@@ -262,6 +262,13 @@ VERIFICADO_ROBLOX_ROLE_ID = 1535396840504299694
 FLT_ROLE_ID = 1238796825381834760   # FLT | Piloto (rol base)
 ATC_ROLE_ID = 1532224008555204669   # ATC | Controlador de Tráfico Aéreo (rol base)
 
+# Rol 100% automático — lo otorga/retira el bot solo, nadie lo asigna a
+# mano. Lo tiene quien está conectado AHORA MISMO a un canal de voz de ATC
+# (una posición abierta o UNICOM), en cualquier aeródromo — se usa para que
+# un anuncio rápido pueda etiquetar solo a "los que están en la frecuencia"
+# en vez de a todo el servidor verificado.
+FRECUENCIA_ROLE_NAME = "🔊 En la Frecuencia"
+
 LLEGADAS_CHANNEL_ID = 1238796825415389294
 
 CUSTOM_ID = "atc24_verificar_aceptacion"
@@ -1256,27 +1263,43 @@ async def _reconciliar_atc_al_arrancar():
     memoria (_atc_close_timers) — sin esto, una posición cuyo canal de voz
     quedó vacío justo antes de un reinicio se quedaría abierta para siempre.
     Recorre las posiciones activas y rearma el timer para las que ya están
-    vacías ahora mismo."""
+    vacías ahora mismo. También se llama periódicamente desde el loop de
+    mantenimiento (no solo al arrancar) — si alguien borra el canal de voz
+    de una posición a mano SIN que nadie más cambie de canal de voz,
+    on_voice_state_update nunca se dispara para detectarlo, así que esta
+    barrida periódica es la única red que lo agarra."""
     if not GUILD_ID:
         return
     guild = client.get_guild(int(GUILD_ID))
     if not guild:
         return
+    hubo_cierres = False
     for fila in await atc_core.get_active_atc(db):
         voice_id = fila.get("voice_channel_id")
         if not voice_id:
             continue
         canal = guild.get_channel(int(voice_id))
         if canal is None:
-            # El canal ya no existe (se borró a mano) — cierra la posición.
+            # El canal ya no existe (se borró a mano) — cierra la posición
+            # con la misma limpieza completa que el resto de las vías de
+            # cierre (aviso programado, canal ATC, dashboard privado).
             cerrada = await atc_core.close_atc(db, fila["uuid"], reason="Canal de voz ya no existe")
             if cerrada:
+                _cancelar_timer_cierre_atc(cerrada["uuid"])
+                await _borrar_aviso_cierre_programado(cerrada)
+                await _cerrar_dashboard_atc(cerrada)
+                hubo_cierres = True
                 print(f"Posición ATC {cerrada['airport']}_{cerrada['position_type']} cerrada: su canal de voz ya no existía.")
             continue
         if not any(not m.bot for m in canal.members) and fila["uuid"] not in _atc_close_timers:
             _atc_close_timers[fila["uuid"]] = client.loop.create_task(
                 _cerrar_atc_por_inactividad(fila["uuid"], voice_id)
             )
+    if hubo_cierres:
+        try:
+            await _repostear_tabla_atc(await _activos_para_tabla())
+        except Exception as err:
+            print(f"ERROR al actualizar la tabla ATC tras cerrar posiciones con canal inexistente: {err}")
 
 
 async def _reconciliar_message_id_guardado(clave: str, channel_id) -> str | None:
@@ -1415,6 +1438,27 @@ async def _mantenimiento_atc_loop():
                     print(f"ERROR al actualizar la tabla ATC tras un cierre programado: {err}")
         except Exception as err:
             print(f"Aviso: fallo al procesar cierres programados de ATC: {err}")
+
+        try:
+            # Red de seguridad: si por lo que sea quedó un aviso de "cierra
+            # en X minutos" pegado en una posición que YA está cerrada (el
+            # caso reportado: el aviso seguía ahí con el tiempo ya vencido
+            # hace rato), se limpia solo en la próxima pasada en vez de
+            # quedar para siempre.
+            for fila in await atc_core.atc_avisos_cierre_huerfanos(db):
+                await _borrar_aviso_cierre_programado(fila)
+                await atc_core.cancel_scheduled_close(db, fila["uuid"])
+        except Exception as err:
+            print(f"Aviso: fallo al limpiar avisos de cierre huérfanos: {err}")
+
+        try:
+            # Misma barrida que al arrancar, pero repetida — agarra
+            # posiciones cuyo canal de voz se borró a mano sin que nadie
+            # cambiara de canal (on_voice_state_update nunca se dispara
+            # para eso).
+            await _reconciliar_atc_al_arrancar()
+        except Exception as err:
+            print(f"Aviso: fallo al reconciliar posiciones ATC con canal de voz inexistente: {err}")
 
 
 @client.event
@@ -3283,10 +3327,68 @@ async def _borrar_canal_voz_sesion_por_inactividad(session_uuid: str, voice_chan
     _academia_voz_close_timers.pop(session_uuid, None)
 
 
+async def _rol_frecuencia(guild: discord.Guild) -> "discord.Role | None":
+    """Rol 100% automático (ver FRECUENCIA_ROLE_NAME) — se crea una sola vez
+    y de ahí en más solo se busca por id guardado en bot_state."""
+    rol_id = await bot_state.get(db, "frecuencia_role_id")
+    if rol_id:
+        rol = guild.get_role(int(rol_id))
+        if rol:
+            return rol
+    rol = discord.utils.get(guild.roles, name=FRECUENCIA_ROLE_NAME)
+    if rol is None:
+        try:
+            rol = await guild.create_role(
+                name=FRECUENCIA_ROLE_NAME, mentionable=True, hoist=False,
+                reason="Rol automático — lo otorga/retira el bot solo según quién está en una frecuencia de ATC",
+            )
+        except discord.Forbidden:
+            print("Aviso: sin permiso para crear el rol automático 'En la Frecuencia'.")
+            return None
+    await bot_state.set(db, "frecuencia_role_id", str(rol.id))
+    return rol
+
+
+async def _es_canal_frecuencia(channel) -> bool:
+    """Un canal "de frecuencia" es UNICOM o el canal de voz de una posición
+    ATC abierta — en cualquier aeródromo."""
+    if channel is None or not isinstance(channel, discord.VoiceChannel):
+        return False
+    if channel.name == atc_core.UNICOM_NAME:
+        return True
+    fila = await atc_core.get_atc_by_voice_channel(db, str(channel.id))
+    return fila is not None
+
+
+async def _sincronizar_rol_frecuencia(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    if member.bot or not GUILD_ID:
+        return
+    ahora_en_frecuencia = await _es_canal_frecuencia(after.channel)
+    if not ahora_en_frecuencia and not await _es_canal_frecuencia(before.channel):
+        return  # ninguno de los dos canales es de ATC — no toca este mecanismo
+    guild = client.get_guild(int(GUILD_ID))
+    if not guild:
+        return
+    rol = await _rol_frecuencia(guild)
+    if not rol:
+        return
+    tiene_rol = rol in member.roles
+    try:
+        if ahora_en_frecuencia and not tiene_rol:
+            await member.add_roles(rol, reason="Se conectó a una frecuencia de ATC")
+        elif not ahora_en_frecuencia and tiene_rol:
+            await member.remove_roles(rol, reason="Ya no está conectado a ninguna frecuencia de ATC")
+    except discord.Forbidden:
+        print(f"Aviso: sin permiso para actualizar el rol de frecuencia de {member}.")
+
+
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if before.channel == after.channel:
         return
+
+    await _sincronizar_rol_frecuencia(member, before, after)
+
     for canal in filter(None, {before.channel, after.channel}):
         fila = await atc_core.get_atc_by_voice_channel(db, str(canal.id))
         if fila:
@@ -3390,19 +3492,27 @@ class AnuncioATCDashboardModal(discord.ui.Modal, title="Anuncio rápido a ATC"):
         placeholder="Se publica en el canal ATC y se borra solo en 5 a 10 minutos.",
     )
 
-    def __init__(self, atc_uuid: str):
+    def __init__(self, atc_uuid: str, audiencia: str = "general"):
         super().__init__()
         self.atc_uuid = atc_uuid
+        self.audiencia = audiencia  # "general" (V) o "frecuencia" (rol automático)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         if not DISCORD_CHANNEL_ATC:
             await interaction.followup.send("No hay un canal ATC configurado.", ephemeral=True)
             return
-        contenido = f"<@&{V_ROLE_ID}> {str(self.texto)}\n\n-# Publicado por {interaction.user.mention}"
+
+        rol_id = V_ROLE_ID
+        if self.audiencia == "frecuencia" and interaction.guild:
+            rol_frecuencia = await _rol_frecuencia(interaction.guild)
+            if rol_frecuencia:
+                rol_id = rol_frecuencia.id
+
+        contenido = f"<@&{rol_id}> {str(self.texto)}\n\n-# Publicado por {interaction.user.mention}"
         payload = {
             "flags": 32768,
-            "allowed_mentions": {"parse": [], "roles": [str(V_ROLE_ID)]},
+            "allowed_mentions": {"parse": [], "roles": [str(rol_id)]},
             "components": [
                 {"type": 17, "accent_color": BRAND_BEACON_AMBER,
                  "components": [{"type": 10, "content": contenido}]},
@@ -3586,6 +3696,24 @@ class ContinuarATISView(discord.ui.View):
         ))
 
 
+class ElegirAudienciaAnuncioView(discord.ui.View):
+    """Paso intermedio (mismo motivo que ContinuarATISView: un botón puede
+    abrir un modal, pero un modal no puede abrir otro modal) para elegir a
+    quién etiqueta el anuncio antes de escribir el texto."""
+
+    def __init__(self, atc_uuid: str):
+        super().__init__(timeout=120)
+        self.atc_uuid = atc_uuid
+
+    @discord.ui.button(label="Solo la frecuencia", style=discord.ButtonStyle.primary, emoji="📻")
+    async def frecuencia_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnuncioATCDashboardModal(self.atc_uuid, "frecuencia"))
+
+    @discord.ui.button(label="General (verificados)", style=discord.ButtonStyle.secondary, emoji="📢")
+    async def general_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnuncioATCDashboardModal(self.atc_uuid, "general"))
+
+
 class ATCDashboardView(discord.ui.View):
     def __init__(self, atc_uuid: str):
         super().__init__(timeout=None)
@@ -3593,7 +3721,12 @@ class ATCDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Anuncio rápido", style=discord.ButtonStyle.primary, emoji="📢")
     async def anuncio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AnuncioATCDashboardModal(self.atc_uuid))
+        await interaction.response.send_message(
+            "¿A quién quieres etiquetar en el anuncio? **Solo la frecuencia** avisa a quienes están conectados "
+            "ahora mismo a un canal de ATC (UNICOM o una posición). **General** etiqueta a todo el servidor "
+            "verificado.",
+            view=ElegirAudienciaAnuncioView(self.atc_uuid), ephemeral=True,
+        )
 
     @discord.ui.button(label="ATIS", style=discord.ButtonStyle.secondary, emoji="🌦️")
     async def atis_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
